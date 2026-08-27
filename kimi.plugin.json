@@ -1,0 +1,18 @@
+{
+  "name": "kimi-gpt-bridge",
+  "version": "0.1.0",
+  "description": "Use your ChatGPT Plus/Pro subscription in Kimi Code CLI via a local OpenAI-compatible bridge",
+  "commands": "./commands/",
+  "skills": "./skills/",
+  "hooks": [
+    {
+      "event": "SessionStart",
+      "command": "node ./hooks/ensure-running.mjs",
+      "timeout": 10
+    }
+  ],
+  "interface": {
+    "displayName": "KimiGPT Bridge",
+    "shortDescription": "Use your ChatGPT Plus/Pro subscription in Kimi Code"
+  }
+}
