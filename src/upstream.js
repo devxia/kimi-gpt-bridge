@@ -43,14 +43,17 @@ export async function upstreamError(res) {
     /* not JSON */
   }
   const e = data?.error ?? null;
-  let message = (typeof e === 'object' ? e?.message : null) ?? data?.detail ?? (text || `HTTP ${res.status}`);
-  const type = (typeof e === 'object' ? e?.type : null) ?? (typeof e === 'string' ? e : null);
-  const code = (typeof e === 'object' ? e?.code : null) ?? null;
+  const nested = e && typeof e === 'object' ? e : null;
+  let message = nested?.message ?? data?.message ?? data?.detail ?? (text || `HTTP ${res.status}`);
+  const type = nested?.type ?? (typeof e === 'string' ? e : null) ?? data?.type ?? null;
+  const code = nested?.code ?? data?.code ?? null;
 
-  if (res.status === 429 && USAGE_LIMIT_TYPES.has(type ?? code)) {
-    const plan = e?.plan_type ? ` (plan: ${e.plan_type})` : '';
-    const resetsAt = e?.resets_at ?? data?.resets_at;
-    const reset = resetsAt ? ` — ${humanizeReset(resetsAt)}` : '';
+  const limitFields = [nested?.type, nested?.code, data?.type, data?.code];
+  if (res.status === 429 && limitFields.some((value) => USAGE_LIMIT_TYPES.has(value))) {
+    const planType = nested?.plan_type ?? data?.plan_type;
+    const plan = planType ? ` (plan: ${planType})` : '';
+    const resetsAt = nested?.resets_at ?? data?.resets_at;
+    const reset = resetsAt != null ? ` — ${humanizeReset(resetsAt)}` : '';
     message = `${message}${plan}${reset}`;
   }
 
@@ -61,22 +64,23 @@ export async function upstreamError(res) {
   return err;
 }
 
-async function postResponses(body, auth, sessionId, fetchImpl) {
+async function postResponses(body, auth, sessionId, fetchImpl, signal) {
   return fetchImpl(`${upstreamBase()}/codex/responses`, {
     method: 'POST',
     headers: upstreamHeaders(auth, sessionId),
     body: JSON.stringify(body),
+    signal,
   });
 }
 
 // POSTs a Responses body upstream. On HTTP 401 the token is force-refreshed
 // and the request retried exactly once.
-export async function callUpstream(body, { sessionId, fetchImpl = fetch } = {}) {
-  let auth = await getValidToken(fetchImpl);
-  let res = await postResponses(body, auth, sessionId, fetchImpl);
+export async function callUpstream(body, { sessionId, fetchImpl = fetch, signal } = {}) {
+  let auth = await getValidToken(fetchImpl, signal);
+  let res = await postResponses(body, auth, sessionId, fetchImpl, signal);
   if (res.status === 401) {
-    auth = await refreshNow(fetchImpl);
-    res = await postResponses(body, auth, sessionId, fetchImpl);
+    auth = await refreshNow(fetchImpl, auth, signal);
+    res = await postResponses(body, auth, sessionId, fetchImpl, signal);
   }
   if (!res.ok) throw await upstreamError(res);
   return res;

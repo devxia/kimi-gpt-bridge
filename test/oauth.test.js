@@ -9,7 +9,17 @@ import {
   buildAuthorizeUrl,
   parseManualInput,
   extractAccountInfo,
+  refreshTokens,
+  pollDeviceToken,
 } from '../src/oauth.js';
+
+function jsonResponse(status, data) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => JSON.stringify(data),
+  };
+}
 
 test('authorize URL contains all required parameters', () => {
   const url = new URL(buildAuthorizeUrl({ codeChallenge: 'cc123', state: 'st456' }));
@@ -88,4 +98,103 @@ test('JWT account info extraction: email from profile claim fallback', () => {
   const info = extractAccountInfo(token);
   assert.equal(info.email, 'p@example.com');
   assert.equal(info.accountId, 'acct_x');
+});
+
+test('refreshTokens passes AbortSignal and escapes a fetch that ignores it', async () => {
+  const controller = new AbortController();
+  const reason = new DOMException('cancelled', 'AbortError');
+  const refresh = refreshTokens('refresh-token', async (_url, options) => {
+    assert.equal(options.signal, controller.signal);
+    return new Promise(() => {});
+  }, controller.signal);
+  controller.abort(reason);
+  await assert.rejects(refresh, (err) => err === reason);
+});
+
+test('refreshTokens cancellation escapes a hanging response body read', async () => {
+  const controller = new AbortController();
+  const reason = new DOMException('cancelled body', 'AbortError');
+  const refresh = refreshTokens('refresh-token', async () => ({
+    ok: true,
+    text: async () => new Promise(() => {}),
+  }), controller.signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort(reason);
+  await assert.rejects(refresh, (err) => err === reason);
+});
+
+test('device polling retries pending responses and returns authorization data', async () => {
+  const responses = [
+    jsonResponse(403, { error: { code: 'deviceauth_authorization_pending' } }),
+    jsonResponse(200, { authorization_code: 'auth-code', code_verifier: 'verifier' }),
+  ];
+  const sleeps = [];
+  const result = await pollDeviceToken(
+    { deviceAuthId: 'device-id', userCode: 'user-code', interval: 2 },
+    {
+      fetchImpl: async (_url, options) => {
+        assert.ok(options.signal instanceof AbortSignal);
+        return responses.shift();
+      },
+      timeoutMs: 1_000,
+      sleep: async (ms) => sleeps.push(ms),
+    },
+  );
+  assert.deepEqual(result, { authorizationCode: 'auth-code', codeVerifier: 'verifier' });
+  assert.deepEqual(sleeps, [2_000, 2_000]);
+});
+
+test('device polling slow_down increases subsequent intervals by five seconds', async () => {
+  const responses = [
+    jsonResponse(400, { error: 'slow_down' }),
+    jsonResponse(200, { authorization_code: 'auth-code', code_verifier: 'verifier' }),
+  ];
+  const sleeps = [];
+  await pollDeviceToken(
+    { deviceAuthId: 'device-id', userCode: 'user-code', interval: 3 },
+    {
+      fetchImpl: async () => responses.shift(),
+      timeoutMs: 1_000,
+      sleep: async (ms) => sleeps.push(ms),
+    },
+  );
+  assert.deepEqual(sleeps, [3_000, 8_000]);
+});
+
+test('device polling deadline aborts and escapes a hanging fetch', async () => {
+  let signal;
+  const poll = pollDeviceToken(
+    { deviceAuthId: 'device-id', userCode: 'user-code', interval: 0 },
+    {
+      fetchImpl: async (_url, options) => {
+        signal = options.signal;
+        return new Promise(() => {});
+      },
+      timeoutMs: 20,
+      sleep: async () => {},
+    },
+  );
+  await assert.rejects(poll, /timed out after 20 milliseconds/);
+  assert.equal(signal.aborted, true);
+});
+
+test('device polling deadline aborts and escapes a hanging response body read', async () => {
+  let signal;
+  const poll = pollDeviceToken(
+    { deviceAuthId: 'device-id', userCode: 'user-code', interval: 0 },
+    {
+      fetchImpl: async (_url, options) => {
+        signal = options.signal;
+        return {
+          ok: false,
+          status: 403,
+          text: async () => new Promise(() => {}),
+        };
+      },
+      timeoutMs: 20,
+      sleep: async () => {},
+    },
+  );
+  await assert.rejects(poll, /timed out after 20 milliseconds/);
+  assert.equal(signal.aborted, true);
 });

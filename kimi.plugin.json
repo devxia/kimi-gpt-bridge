@@ -1,6 +1,6 @@
 {
   "name": "kimi-gpt-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Use your ChatGPT Plus/Pro subscription in Kimi Code CLI via a local OpenAI-compatible bridge",
   "commands": "./commands/",
   "skills": "./skills/",

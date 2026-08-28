@@ -7,53 +7,71 @@ description: How the kimi-gpt-bridge plugin works and how to set it up, log in, 
 
 ## What it does
 
-KimiGPT Bridge lets Kimi Code CLI use a **ChatGPT Plus/Pro subscription** instead of a metered API key. It runs a tiny local HTTP server that speaks the OpenAI Chat Completions API and forwards requests to ChatGPT's internal Codex backend, authenticated with OAuth tokens from a browser (or device-code) login.
+KimiGPT Bridge lets Kimi Code use a **ChatGPT Plus/Pro subscription** instead of a metered API key. Its loopback server supports OpenAI-style Chat Completions and Responses requests and forwards them to ChatGPT's Codex backend using browser or device-code OAuth. It has no npm runtime dependencies.
 
 ## Architecture
 
 ```
 Kimi Code CLI
-   │  OpenAI-compatible API (api_key is a placeholder; loopback only)
+   │  OpenAI-compatible API
+   │  Authorization: Bearer kimi-gpt-bridge
    ▼
-127.0.0.1:1456  ── kimi-gpt-bridge server (this plugin, `src/cli.js serve`)
-   │  translates Chat Completions ⇄ Codex Responses, attaches OAuth token
+127.0.0.1:${KGB_PORT:-1456} ── local bridge (`src/cli.js serve`)
+   │  attaches OAuth credentials and translates when needed
    ▼
 https://chatgpt.com/backend-api/codex/responses
 ```
 
-## Requirements
+`setup` writes `api_key = "kimi-gpt-bridge"`, causing Kimi Code to send the required bearer header. This fixed local credential is not an OpenAI API key.
 
-- Node.js ≥ 18 (no npm dependencies).
+## Requirements and timeouts
+
+- Node.js ≥ 18; Node ≥ 24.5 is needed for environment-proxy support.
+- Python 3.11+ with `tomllib` is required by config-writing commands for independent TOML validation.
 - A ChatGPT Plus/Pro subscription.
-- Ports: **1455** is the OAuth callback listener (fixed, allow-listed by OpenAI — cannot change) and is only used during login; **1456** is the bridge server (override with `KGB_PORT`).
+- **1455** is the fixed, allow-listed OAuth callback port used only during browser login.
+- The bridge defaults to **1456** and follows `KGB_PORT`.
+- Browser callback login waits 10 minutes; device-code polling waits 15 minutes. Agent-run login Bash calls need a timeout of at least 930 seconds.
 
 ## Setup flow
 
-1. Log in (opens a browser; `--device` for headless machines):
-   `node <pluginRoot>/src/cli.js login`
-2. Register the provider in Kimi Code:
-   `node <pluginRoot>/src/cli.js setup`
-3. In Kimi Code: `/reload`, then `/model` → `chatgpt/<slug>` (e.g. `chatgpt/gpt-5.6-terra`).
-4. The plugin's SessionStart hook (`hooks/ensure-running.mjs`) auto-starts the server; or run `node <pluginRoot>/src/cli.js ensure-running` manually.
+1. Log in: `node <pluginRoot>/src/cli.js login`; use `login --device` for headless systems.
+2. Register the provider: `node <pluginRoot>/src/cli.js setup`.
+3. Run `/reload`, then choose `chatgpt/<slug>` with `/model`.
+4. The SessionStart hook auto-starts the bridge; `ensure-running` starts it manually.
 
-The model list is synced live from ChatGPT (`GET /backend-api/codex/models`) during `setup` when logged in, filtered to models visible in your plan, with each model's reasoning efforts written as `support_efforts`/`default_effort`. To refresh it later: `node <pluginRoot>/src/cli.js models sync` (or the refresh slash command), then `/reload`. To inspect the catalog without changing config: `node <pluginRoot>/src/cli.js models list`. If the live fetch fails, a built-in fallback list (currently gpt-5.6-terra, gpt-5.5, gpt-5.4-mini) is used. Reasoning effort can also be set via the model name suffix: `gpt-5.6-terra-high`, `gpt-5.6-terra-low`, etc.
+When logged in, `setup` syncs models visible to the account plan and records their context windows and reasoning efforts. `models sync` refreshes config; `models list` only inspects the live catalog. Setup can use the built-in fallback list when logged out or the catalog is unavailable. `max` effort is supported when a model advertises it; `ultra`, `off`, and `none` remain hidden.
 
-## Where files live
+Config updates identify bridge tables even after Kimi Code moves them or removes marker comments. The complete candidate is validated by a real TOML parser and installed atomically. A refresh refuses to overwrite config if removing models would invalidate `default_model`, `[secondary_model].default_model`, or `[secondary_model.models]` references.
 
-- `~/.kimi-gpt-bridge/` (override with `KGB_HOME`): `auth.json` (OAuth tokens, mode 0600), `config.json` (proxy setting), `models-cache.json` (model list cache, 4h TTL), `server.pid`, `server.log`.
-- `${KIMI_CODE_HOME:-~/.kimi-code}/config.toml`: the block between `# >>> kimi-gpt-bridge >>>` and `# <<< kimi-gpt-bridge <<<` added by `setup`.
+## API behavior
+
+- Generation routes require exactly `Authorization: Bearer kimi-gpt-bridge`.
+- Chat Completions and Responses return JSON when `stream` is omitted or false, and SSE only when it is true.
+- Request bodies are limited to 32 MiB.
+- Chat SSE requires an explicit terminal event before `[DONE]`; streamed Responses is also checked for an explicit terminal event. Truncation becomes an error, and early downstream termination cancels the upstream request/body.
+- Supported tool-selection and parallel-call constraints are preserved.
+- Encrypted reasoning is exposed for portable continuation and can be reused only for the immediately adjacent tool-output continuation; fallback cache entries are bounded and one-shot.
+
+## State and lifecycle
+
+- `~/.kimi-gpt-bridge/` (override with `KGB_HOME`) holds `auth.json` (0600), `config.json`, `models-cache.json`, port-scoped process state, and `server.log`.
+- `${KIMI_CODE_HOME:-~/.kimi-code}/config.toml` holds the provider and `chatgpt/<slug>` model tables. Markers are informational, not the source of truth.
+- Refresh-token rotation is serialized across processes. Logout uses the same credential mutation lock and cannot race an in-flight refresh.
+- PID tracking is scoped by server port, and lifecycle commands verify the `/health` service identity before trusting the process.
+- Proxy output redacts embedded usernames and passwords. Proxy order is `KGB_PROXY` → persisted config → `HTTPS_PROXY`/`HTTP_PROXY`.
 
 ## Troubleshooting
 
-- `status` shows login state and token expiry: `node <pluginRoot>/src/cli.js status`.
-- Login fails with `Country, region, or territory not supported` or `fetch failed`: `auth.openai.com` / `chatgpt.com` are not directly reachable. The bridge automatically honors `HTTPS_PROXY`/`HTTP_PROXY` shell env vars; if those are unset (e.g. only a macOS *system* proxy exists), persist one explicitly and retry:
-  `node <pluginRoot>/src/cli.js proxy http://127.0.0.1:PORT` (your local HTTP proxy address), then `node <pluginRoot>/src/cli.js login`. Requires Node ≥ 24.5 (`NODE_USE_ENV_PROXY`).
-- 401s: the bridge force-refreshes the token once; if refresh itself fails permanently the tokens are dead — run `login` again.
-- 429s from ChatGPT include the plan and a "try again in ~N min" hint.
-- Login fails with no browser / port 1455 busy: use `login --device` (device-code flow) or the manual-paste fallback.
-- Server won't start: check `~/.kimi-gpt-bridge/server.log`; make sure port 1456 is free.
+- `status`: `node <pluginRoot>/src/cli.js status`.
+- For `Country, region, or territory not supported` or `fetch failed`, configure `node <pluginRoot>/src/cli.js proxy http://127.0.0.1:PORT`, then retry login. A macOS system proxy alone is not visible to Node.
+- A 401 triggers one forced refresh and one retry. If refresh is permanently invalid, log in again.
+- 429 errors include reset information when supplied upstream.
+- If browser login cannot bind 1455, use manual paste or `login --device`.
+- If startup fails, inspect `~/.kimi-gpt-bridge/server.log` and check the configured port:
+  `PORT="${KGB_PORT:-1456}"; curl -s "http://127.0.0.1:${PORT}/health"`.
 
 ## Uninstall
 
-1. `node <pluginRoot>/src/cli.js teardown [--purge]` — stops the server and removes the config block; `--purge` also deletes `~/.kimi-gpt-bridge` (credentials).
-2. In Kimi Code: `/plugins remove kimi-gpt-bridge`, then `/reload`.
+1. `node <pluginRoot>/src/cli.js teardown [--purge]` checks all port-scoped PID records, stops only bridge processes whose health identity and PID match, and removes provider/model tables; `--purge` also deletes local bridge state.
+2. Run `/plugins remove kimi-gpt-bridge`, then `/reload`. The managed plugin copy and OpenAI-side OAuth grant remain until removed separately.

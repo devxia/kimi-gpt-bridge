@@ -1,7 +1,10 @@
 // Pure translation between OpenAI Chat Completions and the Codex Responses API.
 import crypto from 'node:crypto';
 
-export const EFFORT_SUFFIXES = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+export const EFFORT_SUFFIXES = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+const MAX_REASONING_CACHE_ENTRIES = 128;
+const encryptedReasoningCache = new Map();
 
 // `gpt-5.4-high` → { model: 'gpt-5.4', effort: 'high' }
 export function parseModelAndEffort(rawModel) {
@@ -19,22 +22,168 @@ function textOf(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
     return content
-      .filter((p) => p && (p.type === 'text' || p.type === 'input_text') && typeof p.text === 'string')
+      .filter(
+        (p) =>
+          p &&
+          (p.type === 'text' || p.type === 'input_text' || p.type === 'output_text') &&
+          typeof p.text === 'string',
+      )
       .map((p) => p.text)
       .join('');
   }
   return String(content);
 }
 
+function toolOutputOf(content) {
+  if (typeof content === 'string') return content;
+  if (
+    Array.isArray(content) &&
+    content.every(
+      (p) =>
+        p &&
+        (p.type === 'text' || p.type === 'input_text' || p.type === 'output_text') &&
+        typeof p.text === 'string',
+    )
+  ) {
+    return textOf(content);
+  }
+  return JSON.stringify(content ?? null);
+}
+
+function mapToolChoice(toolChoice) {
+  if (toolChoice == null) return 'auto';
+  if (typeof toolChoice === 'string') return toolChoice;
+  const name = toolChoice.function?.name ?? toolChoice.name;
+  if (toolChoice.type === 'function' && name) return { type: 'function', name };
+  return toolChoice;
+}
+
+function toResponseReasoningItem(item) {
+  if (!item || item.type !== 'reasoning' || typeof item.encrypted_content !== 'string') return undefined;
+  return {
+    type: 'reasoning',
+    ...(item.id ? { id: item.id } : {}),
+    ...(Array.isArray(item.summary) ? { summary: item.summary } : {}),
+    encrypted_content: item.encrypted_content,
+  };
+}
+
+function reasoningIdentity(item) {
+  return `${item.id ?? ''}\u0000${item.encrypted_content}`;
+}
+
+function uniqueReasoningItems(items) {
+  const seen = new Set();
+  const result = [];
+  for (const raw of items) {
+    const item = toResponseReasoningItem(raw);
+    if (!item) continue;
+    const identity = reasoningIdentity(item);
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    result.push(item);
+  }
+  return result;
+}
+
+function reasoningCacheId(cacheKey, callId) {
+  return JSON.stringify([String(cacheKey), String(callId)]);
+}
+
+function cacheReasoningItems(cacheKey, callId, items) {
+  if (cacheKey == null || !callId || !items.length) return;
+  const key = reasoningCacheId(cacheKey, callId);
+  encryptedReasoningCache.delete(key);
+  encryptedReasoningCache.set(key, uniqueReasoningItems(items));
+  while (encryptedReasoningCache.size > MAX_REASONING_CACHE_ENTRIES) {
+    encryptedReasoningCache.delete(encryptedReasoningCache.keys().next().value);
+  }
+}
+
+function consumeReasoningItems(cacheKey, callIds) {
+  if (cacheKey == null) return [];
+  const itemsByIdentity = new Map();
+  for (const callId of callIds) {
+    const key = reasoningCacheId(cacheKey, callId);
+    const cached = encryptedReasoningCache.get(key);
+    for (const item of cached ?? []) {
+      const identity = reasoningIdentity(item);
+      let portableItem = itemsByIdentity.get(identity);
+      if (!portableItem) {
+        portableItem = { ...item, call_ids: [] };
+        itemsByIdentity.set(identity, portableItem);
+      }
+      portableItem.call_ids.push(callId);
+    }
+    encryptedReasoningCache.delete(key);
+  }
+  return [...itemsByIdentity.values()];
+}
+
+function pruneReasoningCache(cacheKey, allowedCallIds = []) {
+  if (cacheKey == null) return;
+  const allowed = new Set(allowedCallIds.map((callId) => reasoningCacheId(cacheKey, callId)));
+  const namespace = String(cacheKey);
+  for (const key of encryptedReasoningCache.keys()) {
+    const [storedNamespace] = JSON.parse(key);
+    if (storedNamespace === namespace && !allowed.has(key)) encryptedReasoningCache.delete(key);
+  }
+}
+
+function isAdjacentToolContinuation(messages, assistantIndex, callIds) {
+  const continuation = messages.slice(assistantIndex + 1);
+  if (!continuation.length || continuation.some((m) => m?.role !== 'tool')) return false;
+  const expected = new Set(callIds);
+  const actual = new Set(continuation.map((m) => m.tool_call_id));
+  return expected.size === actual.size && [...expected].every((id) => actual.has(id));
+}
+
+function reasoningGroups(rawItems, callIds) {
+  const groupsByCallIds = new Map();
+  for (const raw of rawItems) {
+    const item = toResponseReasoningItem(raw);
+    if (!item) continue;
+    const declaredCallIds = Array.isArray(raw.call_ids) ? new Set(raw.call_ids) : undefined;
+    const associatedCallIds = declaredCallIds
+      ? callIds.filter((callId) => declaredCallIds.has(callId))
+      : [...callIds];
+    if (!associatedCallIds.length) continue;
+    const key = JSON.stringify(associatedCallIds);
+    let group = groupsByCallIds.get(key);
+    if (!group) {
+      group = { items: [], callIds: associatedCallIds };
+      groupsByCallIds.set(key, group);
+    }
+    group.items.push(item);
+  }
+  return [...groupsByCallIds.values()].map((group) => ({
+    ...group,
+    items: uniqueReasoningItems(group.items),
+  }));
+}
+
 // Translate a Chat Completions request into a Codex Responses request body.
-export function chatRequestToResponsesBody(req, { promptCacheKey } = {}) {
+// `reasoningCacheKey` namespaces the one-turn encrypted-reasoning fallback.
+export function chatRequestToResponsesBody(req, { promptCacheKey, reasoningCacheKey } = {}) {
   const { messages = [], tools, reasoning_effort } = req ?? {};
   const { model, effort: suffixEffort } = parseModelAndEffort(req?.model);
+  const cacheKey = reasoningCacheKey;
 
   const instructionParts = [];
   const input = [];
+  const lastAssistantIndex = messages.findLastIndex?.((message) => message?.role === 'assistant') ?? -1;
+  const latestToolCalls =
+    lastAssistantIndex >= 0 && Array.isArray(messages[lastAssistantIndex]?.tool_calls)
+      ? messages[lastAssistantIndex].tool_calls
+      : [];
+  const latestCallIds =
+    lastAssistantIndex >= 0 && isAdjacentToolContinuation(messages, lastAssistantIndex, latestToolCalls.map((tc) => tc?.id).filter(Boolean))
+      ? latestToolCalls.map((tc) => tc?.id).filter(Boolean)
+      : [];
+  pruneReasoningCache(cacheKey, latestCallIds);
 
-  for (const m of messages) {
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const m = messages[messageIndex];
     if (!m || !m.role) continue;
     if (m.role === 'system' || m.role === 'developer') {
       const text = textOf(m.content);
@@ -50,13 +199,25 @@ export function chatRequestToResponsesBody(req, { promptCacheKey } = {}) {
           content.push({ type: 'input_text', text: p.text ?? '' });
         } else if (p.type === 'image_url') {
           const url = typeof p.image_url === 'string' ? p.image_url : p.image_url?.url;
-          if (url) content.push({ type: 'input_image', image_url: url });
+          const detail = typeof p.image_url === 'object' ? p.image_url?.detail : p.detail;
+          if (url) {
+            content.push({ type: 'input_image', image_url: url, ...(detail ? { detail } : {}) });
+          }
         }
       }
       input.push({ role: 'user', content });
       continue;
     }
     if (m.role === 'assistant') {
+      const toolCalls = Array.isArray(m.tool_calls) ? m.tool_calls : [];
+      const callIds = toolCalls.map((tc) => tc.id).filter(Boolean);
+      const adjacentToolContinuation = isAdjacentToolContinuation(messages, messageIndex, callIds);
+      const explicitGroups = adjacentToolContinuation
+        ? reasoningGroups(Array.isArray(m.reasoning_items) ? m.reasoning_items : [], callIds)
+        : [];
+      const cachedItems = adjacentToolContinuation ? consumeReasoningItems(cacheKey, callIds) : [];
+      const groups = explicitGroups.length ? explicitGroups : reasoningGroups(cachedItems, callIds);
+
       const text = textOf(m.content);
       if (text) {
         input.push({
@@ -66,16 +227,32 @@ export function chatRequestToResponsesBody(req, { promptCacheKey } = {}) {
           status: 'completed',
         });
       }
-      for (const tc of m.tool_calls ?? []) {
+
+      const callsById = new Map(toolCalls.map((toolCall) => [toolCall.id, toolCall]));
+      const emittedCallIds = new Set();
+      const pushFunctionCall = (toolCall) => {
         input.push({
           type: 'function_call',
-          call_id: tc.id,
-          name: tc.function?.name,
+          call_id: toolCall.id,
+          name: toolCall.function?.name,
           arguments:
-            typeof tc.function?.arguments === 'string'
-              ? tc.function.arguments
-              : JSON.stringify(tc.function?.arguments ?? {}),
+            typeof toolCall.function?.arguments === 'string'
+              ? toolCall.function.arguments
+              : JSON.stringify(toolCall.function?.arguments ?? {}),
         });
+        emittedCallIds.add(toolCall.id);
+      };
+      for (const group of groups) {
+        const groupedCalls = group.callIds
+          .filter((callId) => !emittedCallIds.has(callId))
+          .map((callId) => callsById.get(callId))
+          .filter(Boolean);
+        if (!groupedCalls.length) continue;
+        input.push(...group.items);
+        for (const toolCall of groupedCalls) pushFunctionCall(toolCall);
+      }
+      for (const toolCall of toolCalls) {
+        if (!emittedCallIds.has(toolCall.id)) pushFunctionCall(toolCall);
       }
       continue;
     }
@@ -83,7 +260,7 @@ export function chatRequestToResponsesBody(req, { promptCacheKey } = {}) {
       input.push({
         type: 'function_call_output',
         call_id: m.tool_call_id,
-        output: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? null),
+        output: toolOutputOf(m.content),
       });
       continue;
     }
@@ -98,8 +275,8 @@ export function chatRequestToResponsesBody(req, { promptCacheKey } = {}) {
     text: { verbosity: 'low' },
     include: ['reasoning.encrypted_content'],
     prompt_cache_key: promptCacheKey,
-    tool_choice: 'auto',
-    parallel_tool_calls: true,
+    tool_choice: mapToolChoice(req?.tool_choice),
+    parallel_tool_calls: req?.parallel_tool_calls ?? true,
   };
 
   // Explicit reasoning_effort wins over the model-name suffix.
@@ -112,7 +289,7 @@ export function chatRequestToResponsesBody(req, { promptCacheKey } = {}) {
       name: t.function?.name,
       description: t.function?.description,
       parameters: t.function?.parameters,
-      strict: false,
+      strict: t.function?.strict ?? false,
     }));
   }
 
@@ -124,13 +301,24 @@ export async function* readChunks(source) {
   const decoder = new TextDecoder();
   if (source && typeof source.getReader === 'function') {
     const reader = source.getReader();
+    let reachedEnd = false;
     try {
       for (;;) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          reachedEnd = true;
+          break;
+        }
         yield decoder.decode(value, { stream: true });
       }
     } finally {
+      if (!reachedEnd) {
+        try {
+          await reader.cancel();
+        } catch {
+          // The stream may already have closed while cancellation was pending.
+        }
+      }
       reader.releaseLock?.();
     }
   } else {
@@ -142,37 +330,35 @@ export async function* readChunks(source) {
   if (tail) yield tail;
 }
 
+function sseData(rawEvent) {
+  const dataLines = [];
+  for (const line of rawEvent.split(/\r\n|\r|\n/)) {
+    if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+  }
+  return dataLines.length ? dataLines.join('\n') : undefined;
+}
+
 // Parses an upstream SSE stream (`data: {json}` lines, event type inside the
 // JSON `type` field) into event objects.
 export async function* parseResponsesSSE(stream) {
   let buffer = '';
   for await (const chunk of readChunks(stream)) {
     buffer += chunk;
-    let idx;
-    while ((idx = buffer.indexOf('\n\n')) >= 0) {
-      const rawEvent = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 2);
-      const dataLines = [];
-      for (const line of rawEvent.split('\n')) {
-        const clean = line.replace(/\r$/, '');
-        if (clean.startsWith('data:')) dataLines.push(clean.slice(5).replace(/^ /, ''));
-      }
-      if (!dataLines.length) continue;
-      const data = dataLines.join('\n');
+    for (;;) {
+      const separator = buffer.match(/\r\n\r\n|\r\r|\n\n/);
+      if (!separator) break;
+      const rawEvent = buffer.slice(0, separator.index);
+      buffer = buffer.slice(separator.index + separator[0].length);
+      const data = sseData(rawEvent);
+      if (data == null) continue;
       if (data === '[DONE]') return;
       yield JSON.parse(data);
     }
   }
-  // Flush a trailing event not terminated by a blank line.
-  const dataLines = [];
-  for (const line of buffer.split('\n')) {
-    const clean = line.replace(/\r$/, '');
-    if (clean.startsWith('data:')) dataLines.push(clean.slice(5).replace(/^ /, ''));
-  }
-  if (dataLines.length) {
-    const data = dataLines.join('\n');
-    if (data !== '[DONE]') yield JSON.parse(data);
-  }
+
+  // Accept a final complete data event even if the upstream omitted its blank line.
+  const data = sseData(buffer);
+  if (data != null && data !== '[DONE]') yield JSON.parse(data);
 }
 
 function usageOf(u) {
@@ -184,20 +370,39 @@ function usageOf(u) {
   };
 }
 
+function incompleteReasonOf(response) {
+  const details = response?.incomplete_details;
+  if (typeof details === 'string') return details;
+  return details?.reason;
+}
+
+function incompleteFinishReason(reason) {
+  return reason === 'content_filter' ? 'content_filter' : 'length';
+}
+
+function portableReasoningItems(groups) {
+  return groups.flatMap((group) =>
+    uniqueReasoningItems(group.items).map((item) => ({ ...item, call_ids: [...group.callIds] })),
+  );
+}
+
 // Translates Responses SSE events into OpenAI chat.completion.chunk objects.
-export async function* createChatChunkStream(events, model) {
+// `reasoningCacheKey` must be stable for one client conversation.
+export async function* createChatChunkStream(events, model, { reasoningCacheKey } = {}) {
   const id = `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
   const created = Math.floor(Date.now() / 1000);
-  const chunk = (delta, finishReason = null, usage = undefined) => ({
+  const chunk = (delta, finishReason = null, usage = undefined, choiceFields = undefined) => ({
     id,
     object: 'chat.completion.chunk',
     created,
     model,
-    choices: [{ index: 0, delta, finish_reason: finishReason }],
+    choices: [{ index: 0, delta, finish_reason: finishReason, ...choiceFields }],
     ...(usage ? { usage } : {}),
   });
 
   let toolCallCount = 0;
+  let activeReasoningGroup;
+  const outputReasoningGroups = [];
   yield chunk({ role: 'assistant' });
 
   for await (const event of events) {
@@ -208,8 +413,22 @@ export async function* createChatChunkStream(events, model) {
       case 'response.reasoning_summary_text.delta':
         yield chunk({ reasoning_content: event.delta ?? '' });
         break;
+      case 'response.refusal.delta':
+      case 'response.output_refusal.delta':
+        yield chunk({ refusal: event.delta ?? '' });
+        break;
       case 'response.output_item.done':
-        if (event.item?.type === 'function_call') {
+        if (event.item?.type === 'reasoning') {
+          const item = toResponseReasoningItem(event.item);
+          if (item) {
+            activeReasoningGroup = { items: [item], callIds: [] };
+            outputReasoningGroups.push(activeReasoningGroup);
+          }
+        } else if (event.item?.type === 'function_call') {
+          if (activeReasoningGroup) {
+            activeReasoningGroup.callIds.push(event.item.call_id);
+            cacheReasoningItems(reasoningCacheKey, event.item.call_id, activeReasoningGroup.items);
+          }
           yield chunk({
             tool_calls: [
               {
@@ -223,12 +442,24 @@ export async function* createChatChunkStream(events, model) {
           toolCallCount += 1;
         }
         break;
-      case 'response.completed':
+      case 'response.completed': {
+        const portableItems = portableReasoningItems(outputReasoningGroups);
+        if (portableItems.length) yield chunk({ reasoning_items: portableItems });
         yield chunk({}, toolCallCount > 0 ? 'tool_calls' : 'stop', usageOf(event.response?.usage));
         return;
-      case 'response.incomplete':
-        yield chunk({}, 'length', usageOf(event.response?.usage));
+      }
+      case 'response.incomplete': {
+        const reason = incompleteReasonOf(event.response);
+        const portableItems = portableReasoningItems(outputReasoningGroups);
+        if (portableItems.length) yield chunk({ reasoning_items: portableItems });
+        yield chunk(
+          {},
+          incompleteFinishReason(reason),
+          usageOf(event.response?.usage),
+          reason ? { incomplete_reason: reason } : undefined,
+        );
         return;
+      }
       case 'response.failed':
         throw new Error(event.response?.error?.message || 'Upstream response failed');
       case 'error':
@@ -237,38 +468,55 @@ export async function* createChatChunkStream(events, model) {
         break; // ignore other event types
     }
   }
+
+  throw new Error('Upstream stream ended before a terminal response event');
 }
 
 // Aggregates a full event stream into one non-streaming chat.completion object.
-export async function collectChatCompletion(events, model) {
+export async function collectChatCompletion(events, model, options) {
   let id = `chatcmpl-${crypto.randomBytes(12).toString('hex')}`;
   let created = Math.floor(Date.now() / 1000);
   let content = '';
   let reasoning = '';
+  let refusal = '';
+  const reasoningItems = [];
   const toolCalls = [];
   let finishReason = 'stop';
+  let incompleteReason;
   let usage;
-  for await (const chunk of createChatChunkStream(events, model)) {
+  for await (const chunk of createChatChunkStream(events, model, options)) {
     id = chunk.id;
     created = chunk.created;
     const choice = chunk.choices[0];
     if (choice.delta?.content) content += choice.delta.content;
     if (choice.delta?.reasoning_content) reasoning += choice.delta.reasoning_content;
+    if (choice.delta?.refusal) refusal += choice.delta.refusal;
+    if (choice.delta?.reasoning_items) reasoningItems.push(...choice.delta.reasoning_items);
     if (choice.delta?.tool_calls) {
       for (const tc of choice.delta.tool_calls) toolCalls[tc.index] = tc;
     }
     if (choice.finish_reason) finishReason = choice.finish_reason;
+    if (choice.incomplete_reason) incompleteReason = choice.incomplete_reason;
     if (chunk.usage) usage = chunk.usage;
   }
   const message = { role: 'assistant', content: content || null };
   if (reasoning) message.reasoning_content = reasoning;
+  if (refusal) message.refusal = refusal;
+  if (reasoningItems.length) message.reasoning_items = reasoningItems;
   if (toolCalls.length) message.tool_calls = toolCalls;
   return {
     id,
     object: 'chat.completion',
     created,
     model,
-    choices: [{ index: 0, message, finish_reason: finishReason }],
+    choices: [
+      {
+        index: 0,
+        message,
+        finish_reason: finishReason,
+        ...(incompleteReason ? { incomplete_reason: incompleteReason } : {}),
+      },
+    ],
     ...(usage ? { usage } : {}),
   };
 }

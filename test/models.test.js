@@ -14,6 +14,7 @@ import {
   buildConfigBlock,
   upsertConfigBlock,
   stripBridgeTables,
+  findChatgptModelReferences,
   clearModelCache,
   modelsCachePath,
 } from '../src/models.js';
@@ -21,6 +22,16 @@ import { saveAuth } from '../src/token-store.js';
 import { createBridgeServer } from '../src/server.js';
 
 const CLI_PATH = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+
+function parseToml(text) {
+  const parsed = spawnSync(
+    'python3',
+    ['-c', 'import json, sys, tomllib; json.dump(tomllib.loads(sys.stdin.read()), sys.stdout)'],
+    { input: text, encoding: 'utf8' },
+  );
+  assert.equal(parsed.status, 0, parsed.stderr);
+  return JSON.parse(parsed.stdout);
+}
 
 const CATALOG = [
   {
@@ -100,6 +111,38 @@ test('selectModels filters by visibility/api/plan and sorts by priority', () => 
   );
 });
 
+test('selectModels rejects malformed strings and deduplicates catalog slugs and efforts', () => {
+  const models = selectModels(
+    [
+      { slug: '', visibility: 'list', supported_in_api: true, priority: 0 },
+      { slug: 42, visibility: 'list', supported_in_api: true, priority: 0 },
+      {
+        slug: 'same',
+        display_name: 42,
+        description: {},
+        visibility: 'list',
+        supported_in_api: true,
+        context_window: -1,
+        default_reasoning_level: {},
+        supported_reasoning_levels: [{ effort: 'low' }, { effort: 'low' }, { effort: 42 }],
+        priority: 1,
+      },
+      { slug: 'same', visibility: 'list', supported_in_api: true, priority: 2 },
+    ],
+    'plus',
+  );
+  assert.deepEqual(models, [
+    {
+      slug: 'same',
+      displayName: 'same',
+      description: '',
+      contextWindow: null,
+      defaultEffort: null,
+      efforts: ['low'],
+    },
+  ]);
+});
+
 test('buildConfigBlock renders markers, provider table and per-model TOML', () => {
   const models = selectModels(CATALOG, 'plus');
   const block = buildConfigBlock(models, 1456);
@@ -127,6 +170,28 @@ test('buildConfigBlock omits efforts lines when unknown', () => {
   assert.ok(!entry.includes('max_context_size'));
   assert.ok(!entry.includes('support_efforts'));
   assert.ok(!entry.includes('default_effort'));
+});
+
+test('buildConfigBlock safely escapes dynamic strings and is valid TOML', () => {
+  const slug = 'gpt."quoted"\\path\n控制';
+  const effort = 'hi"gh\\tier\t';
+  const block = buildConfigBlock(
+    [
+      { slug, contextWindow: 1000, defaultEffort: effort, efforts: [effort] },
+      { slug, contextWindow: 2000, defaultEffort: 'duplicate', efforts: [] },
+    ],
+    '1456"#',
+  );
+  const parsed = parseToml(block);
+  assert.equal(parsed.providers['kimi-gpt-bridge'].base_url, 'http://127.0.0.1:1456"#/v1');
+  assert.equal(parsed.models[`chatgpt/${slug}`].model, slug);
+  assert.deepEqual(parsed.models[`chatgpt/${slug}`].support_efforts, [effort]);
+  assert.equal(parsed.models[`chatgpt/${slug}`].default_effort, effort);
+  assert.equal(Object.keys(parsed.models).length, 1);
+  assert.throws(
+    () => buildConfigBlock([{ slug: 'bad\ud800', efforts: [] }], 1456),
+    /lone surrogates/,
+  );
 });
 
 test('stripBridgeTables removes hoisted unmarked duplicates left by Kimi Code rewrites', () => {
@@ -164,6 +229,147 @@ test('stripBridgeTables removes hoisted unmarked duplicates left by Kimi Code re
   const once = upsertConfigBlock(hoisted, block);
   assert.equal(once.match(/\[providers\.kimi-gpt-bridge\]/g).length, 1);
   assert.equal(once.match(/# >>> kimi-gpt-bridge >>>/g).length, 1);
+  const parsed = parseToml(once);
+  assert.equal(parsed.providers.other.api_key, 'x');
+  assert.equal(parsed.providers['kimi-gpt-bridge'].type, 'openai');
+});
+
+test('stripBridgeTables parses equivalent TOML header identities and preserves other tables', () => {
+  const config = [
+    `${MARKER_START} unrelated words`,
+    `[ providers . 'kimi-gpt-bridge' ] # trailing comment`,
+    'type = "openai"',
+    `[ providers . "kimi\\u002Dgpt-bridge" . 'env' ] # child`,
+    'secret = "remove"',
+    `[ models . 'chatgpt/literal' ] # literal key`,
+    'model = "literal"',
+    `[ models . "chatgpt\\u002Fbasic" . overrides ] # escaped basic key`,
+    'temperature = 1',
+    `[ models . 'chatgptish/keep' ] # similar but not owned`,
+    'provider = "other"',
+    `[ providers . 'kimi-gpt-bridge-other' ]`,
+    'type = "keep"',
+    `[ models . 'other/keep' ]`,
+    'model = "keep"',
+    `${MARKER_END} unrelated words`,
+    '',
+  ].join('\n');
+  const stripped = stripBridgeTables(config);
+  assert.ok(stripped.includes(`${MARKER_START} unrelated words`));
+  assert.ok(stripped.includes(`${MARKER_END} unrelated words`));
+  assert.ok(!stripped.includes('secret ='));
+  assert.ok(!stripped.includes('model = "literal"'));
+  assert.ok(!stripped.includes('temperature ='));
+  assert.ok(stripped.includes("[ models . 'chatgptish/keep' ]"));
+  assert.ok(stripped.includes("[ providers . 'kimi-gpt-bridge-other' ]"));
+  assert.ok(stripped.includes("[ models . 'other/keep' ]"));
+  parseToml(stripped);
+
+  const multiline = [
+    'note = """',
+    `[models.'chatgpt/not-a-header']`,
+    `default_model = 'chatgpt/not-an-assignment'`,
+    '"""',
+    '[other]',
+    'keep = true',
+    '',
+  ].join('\n');
+  assert.equal(stripBridgeTables(multiline), multiline);
+  assert.deepEqual(findChatgptModelReferences(multiline), []);
+});
+
+test('stripBridgeTables removes top-level dotted ownership assignments and their multiline values', () => {
+  const config = [
+    `providers.kimi-gpt-bridge.type = "openai"`,
+    `providers.kimi-gpt-bridge.base_url = """`,
+    `http://127.0.0.1:1456/v1`,
+    `"""`,
+    `models."chatgpt/old".provider = [`,
+    `  "kimi-gpt-bridge",`,
+    `]`,
+    `providers.other.type = "openai"`,
+    `models."other/keep".provider = "other"`,
+    `providers.kimi-gpt-bridge-other.type = "keep"`,
+    `models."chatgptish/keep".provider = "keep"`,
+    `[other]`,
+    `providers.kimi-gpt-bridge.type = "relative-keep"`,
+    `models."chatgpt/relative".provider = '''`,
+    `relative-keep`,
+    `'''`,
+    '',
+  ].join('\n');
+  const original = parseToml(config);
+  assert.equal(original.providers['kimi-gpt-bridge'].type, 'openai');
+  assert.deepEqual(original.models['chatgpt/old'].provider, ['kimi-gpt-bridge']);
+
+  const stripped = stripBridgeTables(config);
+  const parsed = parseToml(stripped);
+  assert.equal(parsed.providers['kimi-gpt-bridge'], undefined);
+  assert.equal(parsed.models['chatgpt/old'], undefined);
+  assert.equal(parsed.providers.other.type, 'openai');
+  assert.equal(parsed.models['other/keep'].provider, 'other');
+  assert.equal(parsed.providers['kimi-gpt-bridge-other'].type, 'keep');
+  assert.equal(parsed.models['chatgptish/keep'].provider, 'keep');
+  assert.equal(parsed.other.providers['kimi-gpt-bridge'].type, 'relative-keep');
+  assert.equal(parsed.other.models['chatgpt/relative'].provider, 'relative-keep\n');
+});
+
+test('findChatgptModelReferences handles quoted and dotted TOML forms', () => {
+  const config = [
+    `default_model = 'chatgpt/primary' # trailing`,
+    `[ 'secondary_model' ] # table`,
+    `default_model = "chatgpt/sec\\u006Fndary"`,
+    `[ secondary_model . models ]`,
+    `'chatgpt/literal' = 1`,
+    `"chatgpt/basic\\u002Dkey" = 2`,
+    `'other/keep' = 3`,
+    `[other]`,
+    `default_model = 'chatgpt/not-top-level'`,
+    `secondary_model.models.'chatgpt/dotted' = 4`,
+    '',
+  ].join('\n');
+  assert.deepEqual(findChatgptModelReferences(config), [
+    'default_model = "chatgpt/primary"',
+    '[secondary_model] default_model = "chatgpt/secondary"',
+    '[secondary_model.models] entry "chatgpt/literal"',
+    '[secondary_model.models] entry "chatgpt/basic-key"',
+  ]);
+  assert.deepEqual(
+    findChatgptModelReferences(`secondary_model.default_model = 'chatgpt/dotted'\nsecondary_model.models.'chatgpt/map' = 1\n`),
+    [
+      '[secondary_model] default_model = "chatgpt/dotted"',
+      '[secondary_model.models] entry "chatgpt/map"',
+    ],
+  );
+});
+
+test('findChatgptModelReferences decodes multiline basic and literal strings', () => {
+  const config = [
+    `default_model = """`,
+    `chatgpt/multiline-basic"""`,
+    `[secondary_model]`,
+    `default_model = '''`,
+    `chatgpt/multiline-literal'''`,
+    `[secondary_model.models]`,
+    `"chatgpt/map" = 1`,
+    '',
+  ].join('\n');
+  const parsed = parseToml(config);
+  assert.equal(parsed.default_model, 'chatgpt/multiline-basic');
+  assert.equal(parsed.secondary_model.default_model, 'chatgpt/multiline-literal');
+  assert.deepEqual(findChatgptModelReferences(config), [
+    'default_model = "chatgpt/multiline-basic"',
+    '[secondary_model] default_model = "chatgpt/multiline-literal"',
+    '[secondary_model.models] entry "chatgpt/map"',
+  ]);
+});
+
+test('findChatgptModelReferences leaves inline-table decoding to tomllib', () => {
+  const config = `secondary_model = { default_model = "chatgpt/inline", models = { "chatgpt/map" = 1 } }\n`;
+  const parsed = parseToml(config);
+  assert.equal(parsed.secondary_model.default_model, 'chatgpt/inline');
+  assert.equal(parsed.secondary_model.models['chatgpt/map'], 1);
+  assert.deepEqual(findChatgptModelReferences(config), []);
 });
 
 test('upsertConfigBlock appends once and replaces in place (idempotent)', () => {
