@@ -1,39 +1,49 @@
 # AGENTS.md
 
-Pitfalls and hard-won lessons for anyone modifying **kimi-gpt-bridge** (a Kimi Code plugin bridging Kimi Code to a ChatGPT subscription via a local OpenAI-compatible server). Read this before touching the code — every item here was learned the hard way.
+Pitfalls and hard-won lessons for anyone modifying **kimi-gpt-bridge** (a Kimi Code plugin bridging Kimi Code to a ChatGPT subscription via a local OpenAI-compatible server). Read this before touching the code—every item here was learned the hard way.
 
-## Kimi Code rewrites config.toml — never trust marker comments
+## Kimi Code rewrites config.toml—never trust marker comments
 
-Kimi Code re-serializes `config.toml` on some writes: it **hoists `[providers.*]` / `[models.*]` tables into its own canonical sections and drops all comments**, including our `# >>> kimi-gpt-bridge >>>` markers. A sync that only replaced the marked block once produced a duplicate `[providers.kimi-gpt-bridge]` declaration, which makes Kimi Code fail at startup with `failed to decode config.toml as toml`.
+Kimi Code re-serializes `config.toml` on some writes: it **hoists `[providers.*]` / `[models.*]` tables into canonical sections and drops comments**, including our markers. A sync that only replaced the marked block once produced a duplicate provider declaration and made Kimi Code fail startup TOML decoding.
 
-- Always locate bridge entries **by table identity** (`[providers.kimi-gpt-bridge]`, `[models."chatgpt/<slug>"]`), never by markers alone — see `stripBridgeTables()` in `src/models.js`.
-- Appended TOML blocks must go at the **end** of the file (top-level scalars after a `[table]` header would be parsed into that table).
-- Kimi Code config validation **fails loudly**: an unresolved `default_model` / `secondary_model` reference breaks session startup. `teardown` must warn about these (it does).
+- Locate bridge entries **by decoded table identity** (`[providers.kimi-gpt-bridge]`, `[models."chatgpt/<slug>"]`), never by markers alone.
+- Parse the complete candidate with a **real TOML parser** before changing the file, then write through a same-directory temporary file and atomic rename. Hand-written table scanning is for ownership/reference discovery, not validation.
+- Append the generated block at the **end**: top-level assignments after a table header otherwise belong to that table.
+- A refresh that removes a model referenced by `default_model`, `[secondary_model].default_model`, or `[secondary_model.models]` must **refuse the write**. Do not leave Kimi Code with unresolved references.
 
-## Plugin mechanics that surprise
+## Plugin and local API mechanics that surprise
 
-- Kimi Code plugins **cannot register providers or extend `/login`**; the only integration surface is a `type = "openai"` provider in `config.toml` pointing at the local server. The `/model` list comes from static `[models.*]` config entries — the server's `/v1/models` route is **not** what populates it.
-- Kimi Code runs the **managed copy** (`~/.kimi-code/plugins/managed/kimi-gpt-bridge/`). Editing this repo has **no effect** on an installed plugin until the files are copied over or the plugin is reinstalled. During development, sync every changed file and `diff`-verify.
-- Plugin slash commands are just prompts telling the agent to run a CLI subcommand via Bash — they are not code. Hooks must **always exit 0** (they run inside session startup).
-- `/plugins remove` deletes only the installation record; the managed copy stays on disk. Uninstall flows must account for that.
+- Plugins cannot register providers or extend `/login`; integration is a `type = "openai"` provider in `config.toml`. `/model` comes from static `[models.*]` entries, not `/v1/models`.
+- Generated config deliberately sets `api_key = "kimi-gpt-bridge"`. Generation routes must require exactly `Authorization: Bearer kimi-gpt-bridge`; loopback binding is not a reason to accept arbitrary bearer values.
+- OpenAI's default is non-streaming: omitted `stream` and `stream:false` return JSON for both Chat Completions and Responses; only `stream:true` returns SSE. Upstream may still require streaming transport internally.
+- Keep the **32 MiB** request-body cap on generation routes. Return a bounded client error rather than buffering without limit.
+- Chat SSE must reach `response.completed` or `response.incomplete` before `[DONE]`; streamed Responses must also observe an explicit terminal event. EOF is an error, and early downstream termination must cancel the upstream request/body.
+- Lifecycle state is **port-scoped**. Do not reuse a PID record across `KGB_PORT` values, and verify the `/health` service identity before trusting or killing a recorded PID.
+- Kimi Code runs the managed copy (`~/.kimi-code/plugins/managed/kimi-gpt-bridge/`). Editing this checkout does not update an installed plugin.
+- Slash commands are prompts that invoke Bash, not code. Hooks must always exit 0. Login waits 10 minutes for browser OAuth and 15 minutes for device authorization, so slash-command Bash timeouts must be at least **930 seconds**.
+- `/plugins remove` leaves the managed copy on disk; uninstall guidance must account for it.
 
 ## Network: proxy env vars only work at process bootstrap
 
-Node's fetch (undici) reads `NODE_USE_ENV_PROXY` / `HTTPS_PROXY` **only at process startup** — setting `process.env` in-process does nothing. Hence `reexecWithProxyIfNeeded()` in `src/proxy.js` (guarded by `KGB_REEXEC`). Don't try to "fix" this by setting env vars at runtime.
+Node fetch reads `NODE_USE_ENV_PROXY` / `HTTPS_PROXY` at process startup. Keep the guarded re-exec; setting proxy variables later in-process does not work.
 
-Proxy resolution order is `KGB_PROXY` env → persisted `config.json` → `HTTPS_PROXY`/`HTTP_PROXY` shell env (the conventional fallback, so proxied shells need zero setup). macOS **system** proxy is invisible to terminal processes — that's the case that still needs `kimi-gpt-bridge proxy <url>`.
+Proxy order is `KGB_PROXY` → persisted `config.json` → `HTTPS_PROXY`/`HTTP_PROXY`. A macOS system proxy is invisible to terminal processes and still needs `kimi-gpt-bridge proxy <url>`. Any proxy shown in logs or CLI output must redact username/password userinfo.
 
-Symptom-to-cause: browser login succeeds but token exchange fails with `Country, region, or territory not supported` or `fetch failed` → the **terminal's** network can't reach OpenAI (browser used the system proxy; Node didn't). Fix is `kimi-gpt-bridge proxy <url>`, not re-login.
+Browser login succeeding while token exchange reports `Country, region, or territory not supported` or `fetch failed` means the terminal path cannot reach OpenAI. Configure the proxy instead of repeating login.
 
-## Upstream (ChatGPT Codex backend) facts that bite
+## Upstream and authentication facts that bite
 
-- **Refresh tokens rotate**: always persist the new `refresh_token` from a refresh response. Concurrent refreshes must share one in-flight request (`token-store.js` mutex) — a reused rotated token permanently kills the chain and forces re-login.
-- **Context window**: use the catalog's `context_window` (272k). `max_context_window` (872k/1M) is the model's hard capacity and is **not** honored on the Codex subscription path; pi and Codex CLI both use `context_window`. Over-declaring makes Kimi Code compact too late and requests past 272k fail upstream.
-- Reasoning tiers `ultra` / `off` are deliberately filtered out (`EXCLUDED_EFFORTS` in `src/models.js`) — keep that filter on every catalog refresh path.
-- OAuth callback port **1455 is allow-listed by OpenAI** and cannot be made configurable; on bind failure fall back to manual paste (already implemented).
-- Request shape is mandatory: `store:false, stream:true, include:["reasoning.encrypted_content"]`. A 401 means force-refresh once and retry; a 429 carries `resets_at` — surface it, never auto-retry in a loop.
+- **Refresh tokens rotate**. Persist each replacement and serialize refresh across Node processes with the auth-file lock. Logout/auth deletion must use the same mutation lock so it cannot race an in-flight refresh.
+- Use catalog `context_window`, not `max_context_window`; over-declaring causes compaction after the subscription path's accepted window.
+- `ultra`, `off`, and `none` stay filtered. `max` is a supported effort and must remain accepted in catalog config, explicit `reasoning_effort`, and model suffix parsing.
+- OAuth callback port **1455** is allow-listed and fixed. Browser callback timeout is 10 minutes; device polling timeout is 15 minutes.
+- Upstream request shape is mandatory: `store:false, stream:true, include:["reasoning.encrypted_content"]`. Preserve supported tool-selection/parallel-call constraints.
+- Encrypted reasoning belongs immediately before the matching function calls on the adjacent tool continuation. Return portable reasoning metadata when possible; keep any cache fallback bounded, conversation-scoped, adjacent-only, and one-shot.
+- On 401, force-refresh once and retry once. Surface 429 reset information; never loop retries.
 
 ## Testing / workflow
 
-- `npm test` must stay **fully offline** — inject `fetchImpl`, point `KGB_HOME`/`KIMI_CODE_HOME` at temp dirs, never hit `auth.openai.com`/`chatgpt.com` from tests.
-- Verify config-writing changes with a real TOML parse (e.g. `python3 -c "import tomllib; tomllib.load(...)"`) — eyeballing generated TOML has failed us before.
+- The project has **zero npm runtime dependencies**; use Node built-ins. Config mutation deliberately invokes the system `python3` / `tomllib` as the independent TOML parser rather than adding an npm parser dependency.
+- `npm test` must stay fully offline: inject `fetchImpl`, isolate `KGB_HOME`/`KIMI_CODE_HOME`, and never contact OpenAI or ChatGPT.
+- Config-writing tests must invoke a real TOML parse; generated text that merely looks valid is insufficient.
+- Cover request limits, exact local bearer auth, stream/non-stream defaults, terminal SSE/error cancellation, cross-process refresh/logout locking, invalid-reference refusal, port-scoped PID identity, proxy redaction, and `max` effort behavior.

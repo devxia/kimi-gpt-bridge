@@ -5,25 +5,34 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
+const SERVICE = 'kimi-gpt-bridge';
 const PORT = Number(process.env.KGB_PORT || 1456);
 
 function selfDir() {
-  return path.dirname(decodeURIComponent(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, '$1'));
+  return path.dirname(fileURLToPath(import.meta.url));
 }
 
 const pluginRoot = process.env.KIMI_PLUGIN_ROOT || path.dirname(selfDir());
 const kgbHome = process.env.KGB_HOME || path.join(os.homedir(), '.kimi-gpt-bridge');
 
 async function healthy() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1000);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1000);
     const res = await fetch(`http://127.0.0.1:${PORT}/health`, { signal: controller.signal });
-    clearTimeout(timer);
-    return res.ok;
+    if (!res.ok) return false;
+    const health = await res.json();
+    return (
+      health?.service === SERVICE &&
+      (health?.version === undefined || typeof health.version === 'string') &&
+      (health.port === undefined || health.port === PORT)
+    );
   } catch {
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -31,10 +40,17 @@ try {
   if (!(await healthy())) {
     fs.mkdirSync(kgbHome, { recursive: true, mode: 0o700 });
     const logFd = fs.openSync(path.join(kgbHome, 'server.log'), 'a');
-    const child = spawn(process.execPath, [path.join(pluginRoot, 'src', 'cli.js'), 'serve'], {
-      detached: true,
-      stdio: ['ignore', logFd, logFd],
-    });
+    let child;
+    try {
+      child = spawn(
+        process.execPath,
+        [path.join(pluginRoot, 'src', 'cli.js'), 'serve', '--port', String(PORT)],
+        { detached: true, stdio: ['ignore', logFd, logFd] },
+      );
+    } finally {
+      fs.closeSync(logFd);
+    }
+    child.on('error', () => {});
     child.unref();
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {

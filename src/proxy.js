@@ -50,23 +50,61 @@ export function resolveProxy() {
   return process.env.KGB_PROXY || loadConfig().proxy || proxyEnvFallback();
 }
 
+// Safe for status output: preserve the destination while hiding userinfo.
+export function redactProxyUrl(proxy) {
+  if (!proxy) return proxy;
+  try {
+    const url = new URL(proxy);
+    if (url.username) url.username = '***';
+    if (url.password) url.password = '***';
+    return url.toString();
+  } catch {
+    return String(proxy).replace(/^([a-z][a-z\d+.-]*:\/\/)[^/@]*@/i, '$1***:***@');
+  }
+}
+
+export function mergeNoProxy(noProxy = '') {
+  const entries = String(noProxy).split(',').map((entry) => entry.trim()).filter(Boolean);
+  const existing = new Set(entries.map((entry) => entry.toLowerCase()));
+  for (const local of ['localhost', '127.0.0.1']) {
+    if (!existing.has(local)) entries.push(local);
+  }
+  return entries.join(',');
+}
+
+// Pure predicate exported so callers can inspect re-exec behavior without
+// spawning a child process or exiting the current one.
+export function shouldReexecWithProxy(proxy, env = process.env) {
+  if (!proxy || env.KGB_REEXEC === '1') return false;
+  return !(
+    env.NODE_USE_ENV_PROXY === '1' &&
+    env.HTTPS_PROXY === proxy &&
+    env.HTTP_PROXY === proxy
+  );
+}
+
 // Effective proxy plus where it came from, for the `proxy` subcommand display.
 export function describeProxy() {
-  if (process.env.KGB_PROXY) return { proxy: process.env.KGB_PROXY, source: 'KGB_PROXY env var (overrides config)' };
+  if (process.env.KGB_PROXY) return { proxy: redactProxyUrl(process.env.KGB_PROXY), source: 'KGB_PROXY env var (overrides config)' };
   const configured = loadConfig().proxy;
-  if (configured) return { proxy: configured, source: configPath() };
+  if (configured) return { proxy: redactProxyUrl(configured), source: configPath() };
   const env = proxyEnvFallback();
-  if (env) return { proxy: env, source: 'HTTPS_PROXY/HTTP_PROXY env var' };
+  if (env) return { proxy: redactProxyUrl(env), source: 'HTTPS_PROXY/HTTP_PROXY env var' };
   return { proxy: null, source: null };
+}
+
+export function reexecExitCode(child) {
+  if (child.error || child.signal || !Number.isInteger(child.status)) return 1;
+  return child.status;
 }
 
 // Called at the top of CLI dispatch for network-touching subcommands. Setting
 // NODE_USE_ENV_PROXY/HTTPS_PROXY inside a running process is too late (undici
 // reads them at bootstrap), so we re-exec the same CLI with the env prepared.
-// KGB_REEXEC guards against infinite recursion.
+// KGB_REEXEC only guards the child from a second re-exec.
 export function reexecWithProxyIfNeeded(scriptPath) {
   const proxy = resolveProxy();
-  if (!proxy || process.env.NODE_USE_ENV_PROXY || process.env.KGB_REEXEC) return;
+  if (!shouldReexecWithProxy(proxy)) return;
   const child = spawnSync(process.execPath, [scriptPath, ...process.argv.slice(2)], {
     stdio: 'inherit',
     env: {
@@ -74,9 +112,9 @@ export function reexecWithProxyIfNeeded(scriptPath) {
       NODE_USE_ENV_PROXY: '1',
       HTTPS_PROXY: proxy,
       HTTP_PROXY: proxy,
-      NO_PROXY: 'localhost,127.0.0.1',
+      NO_PROXY: mergeNoProxy(process.env.NO_PROXY ?? process.env.no_proxy),
       KGB_REEXEC: '1',
     },
   });
-  process.exit(child.status ?? 0);
+  process.exit(reexecExitCode(child));
 }

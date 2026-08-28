@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   generatePKCE,
   generateState,
@@ -22,12 +22,11 @@ import {
   CALLBACK_PORT,
 } from './oauth.js';
 import { fileURLToPath } from 'node:url';
-import { kgbHome, loadAuth, saveAuth, deleteAuth, getValidToken } from './token-store.js';
+import { kgbHome, loadAuth, saveAuth, deleteAuthAsync, getValidToken } from './token-store.js';
 import { startServer, getPort } from './server.js';
-import { upstreamBase, upstreamHeaders } from './upstream.js';
-import { configPath, loadConfig, saveConfig, describeProxy, reexecWithProxyIfNeeded } from './proxy.js';
+import { upstreamBase, upstreamHeaders, upstreamError, VERSION } from './upstream.js';
+import { configPath, loadConfig, describeProxy, redactProxyUrl, reexecWithProxyIfNeeded } from './proxy.js';
 import {
-  MARKER_START,
   STATIC_FALLBACK_MODELS,
   fetchModelCatalog,
   selectModels,
@@ -37,7 +36,8 @@ import {
   saveModelsCache,
 } from './models.js';
 
-const CLI_PATH = decodeURIComponent(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, '$1');
+export const SERVICE = 'kimi-gpt-bridge';
+const CLI_PATH = fileURLToPath(import.meta.url);
 
 const USAGE = `kimi-gpt-bridge — use your ChatGPT Plus/Pro subscription in Kimi Code
 
@@ -78,15 +78,45 @@ function parseFlags(args) {
   return flags;
 }
 
-function openBrowser(url) {
+export function openBrowser(url, spawnImpl = spawn) {
   const platform = process.platform;
   const cmd = platform === 'darwin' ? 'open' : platform === 'win32' ? 'start' : 'xdg-open';
   try {
-    const child = spawn(cmd, [url], { stdio: 'ignore', detached: true, shell: platform === 'win32' });
+    const child = spawnImpl(cmd, [url], { stdio: 'ignore', detached: true, shell: platform === 'win32' });
+    // Missing browser launchers report failure asynchronously through `error`.
+    // The login URL is already printed, so this remains best effort.
+    child.on('error', () => {});
     child.unref();
   } catch {
     // Browser could not be opened; the URL is printed for manual use.
   }
+}
+
+function atomicWriteFile(file, content, { mode, validate } = {}) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const existingMode = fs.existsSync(file) ? fs.statSync(file).mode & 0o777 : undefined;
+  const targetMode = mode ?? existingMode ?? 0o600;
+  const tmp = path.join(
+    path.dirname(file),
+    `.${path.basename(file)}.tmp-${process.pid}-${crypto.randomUUID()}`,
+  );
+  try {
+    fs.writeFileSync(tmp, content, { mode: targetMode });
+    fs.chmodSync(tmp, targetMode);
+    validate?.(tmp);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try { fs.rmSync(tmp); } catch (cleanupErr) {
+      if (cleanupErr.code !== 'ENOENT') err.cleanupError = cleanupErr;
+    }
+    throw err;
+  }
+}
+
+function saveProxyConfig(config) {
+  fs.mkdirSync(kgbHome(), { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(kgbHome(), 0o700); } catch { /* best effort */ }
+  atomicWriteFile(configPath(), JSON.stringify(config, null, 2), { mode: 0o600 });
 }
 
 function promptLine(question) {
@@ -169,7 +199,7 @@ function waitForCallback(expectedState, timeoutMs = 600_000) {
   });
 }
 
-function persistLogin(tokens) {
+export function persistLogin(tokens) {
   const info = extractAccountInfo(tokens.access);
   const auth = {
     access: tokens.access,
@@ -188,8 +218,8 @@ function persistLogin(tokens) {
   if (usedProxy) {
     const config = loadConfig();
     config.proxy = usedProxy;
-    saveConfig(config);
-    console.log(`Proxy saved to config (${usedProxy}): the bridge server will use it automatically.`);
+    saveProxyConfig(config);
+    console.log(`Proxy saved to config (${redactProxyUrl(usedProxy)}): the bridge server will use it automatically.`);
   }
 }
 
@@ -234,8 +264,8 @@ async function cmdLogin(flags) {
 async function cmdServe(flags) {
   const port = flags.port ?? getPort();
   const { server } = await startServer({ port });
-  const address = server.address();
-  console.log(`kimi-gpt-bridge listening on http://127.0.0.1:${address.port}/v1`);
+  const actualPort = server.address().port;
+  console.log(`kimi-gpt-bridge listening on http://127.0.0.1:${actualPort}/v1`);
   console.log(`Logs: ${path.join(kgbHome(), 'server.log')}`);
 }
 
@@ -252,20 +282,30 @@ async function cmdStatus() {
   console.log(
     `Access token: ${minsLeft > 0 ? `valid (expires in ~${minsLeft} min)` : 'expired (will refresh on next use)'}`,
   );
-  // Best-effort usage check — failures are tolerated silently.
+  // Usage is best effort unless authentication itself is permanently invalid.
   try {
     const valid = await getValidToken();
     const res = await fetch(`${upstreamBase()}/wham/usage`, {
       headers: upstreamHeaders(valid, crypto.randomUUID()),
     });
-    if (res.ok) console.log(`Usage:       ${await res.text()}`);
-  } catch {
-    /* best effort */
+    if (res.ok) {
+      console.log(`Usage:       ${await res.text()}`);
+    } else if (res.status === 401 || res.status === 403) {
+      const err = await upstreamError(res);
+      console.error(`Authentication failed: ${err.message}. Run \`kimi-gpt-bridge login\` again.`);
+      process.exitCode = 1;
+    }
+  } catch (err) {
+    if (err?.status === 401 || err?.code === 'session_invalid' || err?.code === 'authentication_required') {
+      console.error(`Authentication failed: ${err.message}`);
+      process.exitCode = 1;
+    }
+    // Transient network/usage endpoint failures remain best effort.
   }
 }
 
-function cmdLogout() {
-  deleteAuth();
+async function cmdLogout() {
+  await deleteAuthAsync();
   console.log('Logged out — stored credentials deleted.');
 }
 
@@ -295,13 +335,86 @@ async function resolveModels() {
   return STATIC_FALLBACK_MODELS;
 }
 
+const TOML_REFERENCES_SCRIPT = String.raw`
+import json, sys, tomllib
+with open(sys.argv[1], "rb") as file:
+    config = tomllib.load(file)
+references = []
+def add(setting, model):
+    if isinstance(model, str) and model.startswith("chatgpt/"):
+        references.append({"setting": setting, "model": model})
+add("default_model", config.get("default_model"))
+secondary = config.get("secondary_model")
+if isinstance(secondary, dict):
+    add("secondary_model.default_model", secondary.get("default_model"))
+    models = secondary.get("models")
+    if isinstance(models, dict):
+        for model in models:
+            add("secondary_model.models", model)
+json.dump(references, sys.stdout)
+`;
+
+function readTomlModelReferences(file) {
+  if (!fs.existsSync(file)) return [];
+  const parsed = spawnSync('python3', ['-c', TOML_REFERENCES_SCRIPT, file], { encoding: 'utf8' });
+  if (parsed.error) {
+    throw new Error(`Could not inspect config.toml with Python tomllib: ${parsed.error.message}`);
+  }
+  if (parsed.status !== 0) {
+    const detail = parsed.stderr.trim().split('\n').at(-1) || `parser exited ${parsed.status}`;
+    throw new Error(`Could not parse config.toml with Python tomllib: ${detail}`);
+  }
+  try {
+    const references = JSON.parse(parsed.stdout);
+    if (!Array.isArray(references)) throw new Error('reference output was not an array');
+    return references;
+  } catch (err) {
+    throw new Error(`Could not decode Python tomllib reference output: ${err.message}`);
+  }
+}
+
+function describeModelReference({ setting, model }) {
+  if (setting === 'default_model') return `default_model = ${JSON.stringify(model)}`;
+  if (setting === 'secondary_model.default_model') {
+    return `[secondary_model] default_model = ${JSON.stringify(model)}`;
+  }
+  return `[secondary_model.models] entry ${JSON.stringify(model)}`;
+}
+
+function validateTomlFile(file) {
+  const parsed = spawnSync(
+    'python3',
+    ['-c', 'import sys, tomllib\nwith open(sys.argv[1], "rb") as f: tomllib.load(f)', file],
+    { encoding: 'utf8' },
+  );
+  if (parsed.error) {
+    throw new Error(`Could not validate config.toml with Python tomllib: ${parsed.error.message}`);
+  }
+  if (parsed.status !== 0) {
+    const detail = parsed.stderr.trim().split('\n').at(-1) || `parser exited ${parsed.status}`;
+    throw new Error(`Refusing to write invalid config.toml: ${detail}`);
+  }
+}
+
+function writeKimiConfig(configFile, content) {
+  atomicWriteFile(configFile, content, { validate: validateTomlFile });
+}
+
 function writeConfigBlock(models) {
   const port = getPort();
   const configFile = kimiConfigPath();
-  fs.mkdirSync(path.dirname(configFile), { recursive: true });
   const existing = fs.existsSync(configFile) ? fs.readFileSync(configFile, 'utf8') : '';
-  const replacing = existing.includes(MARKER_START);
-  fs.writeFileSync(configFile, upsertConfigBlock(existing, buildConfigBlock(models, port)));
+  const available = new Set(models.map((model) => `chatgpt/${model.slug}`));
+  const stale = readTomlModelReferences(configFile).filter(({ model }) => !available.has(model));
+  if (stale.length) {
+    const details = stale.map((reference) => `  - ${describeModelReference(reference)}`).join('\n');
+    throw new Error(
+      `Refusing to update config.toml because these settings reference models absent from the new catalog:\n${details}\nThe original config.toml is unchanged. Choose available models and retry.`,
+    );
+  }
+  const replacing = stripBridgeTables(existing) !== existing;
+  const candidate = upsertConfigBlock(existing, buildConfigBlock(models, port));
+  writeKimiConfig(configFile, candidate);
   return { configFile, replacing };
 }
 
@@ -343,88 +456,188 @@ async function cmdModels(args) {
   console.log('\nRun `/reload` in Kimi Code, then pick a model with `/model`.');
 }
 
-async function healthy(port, timeoutMs = 1000) {
+export async function healthy(port, timeoutMs = 1000, { pid } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: controller.signal });
-    clearTimeout(timer);
-    return res.ok;
+    if (!res.ok) return null;
+    const health = await res.json();
+    if (health?.service !== SERVICE) return null;
+    if (health.version !== undefined && typeof health.version !== 'string') return null;
+    if (health.port !== port) return null;
+    if (!Number.isSafeInteger(health.pid) || health.pid <= 0) return null;
+    if (pid !== undefined && health.pid !== pid) return null;
+    return health;
   } catch {
-    return false;
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// Used by the Kimi Code SessionStart hook — must never fail the session.
 async function cmdEnsureRunning(flags) {
+  const port = flags.port ?? getPort();
+  if (await healthy(port)) {
+    console.log(`kimi-gpt-bridge already running on 127.0.0.1:${port}.`);
+    return;
+  }
+  fs.mkdirSync(kgbHome(), { recursive: true, mode: 0o700 });
+  const logFd = fs.openSync(path.join(kgbHome(), 'server.log'), 'a');
+  let child;
   try {
-    const port = flags.port ?? getPort();
-    if (await healthy(port)) {
-      console.log(`kimi-gpt-bridge already running on 127.0.0.1:${port}.`);
-      return;
-    }
-    fs.mkdirSync(kgbHome(), { recursive: true, mode: 0o700 });
-    const logFd = fs.openSync(path.join(kgbHome(), 'server.log'), 'a');
-    const child = spawn(process.execPath, [CLI_PATH, 'serve'], {
+    child = spawn(process.execPath, [CLI_PATH, 'serve', '--port', String(port)], {
       detached: true,
       stdio: ['ignore', logFd, logFd],
     });
-    child.unref();
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 500));
-      if (await healthy(port)) {
-        console.log(`kimi-gpt-bridge started on 127.0.0.1:${port}.`);
-        return;
-      }
-    }
-    console.log('kimi-gpt-bridge did not become healthy within 5s — check server.log.');
-  } catch (err) {
-    console.log(`ensure-running: ${err.message}`);
   } finally {
-    process.exitCode = 0; // hooks must never block Kimi Code
+    fs.closeSync(logFd);
+  }
+  child.on('error', () => {});
+  child.unref();
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (await healthy(port)) {
+      console.log(`kimi-gpt-bridge started on 127.0.0.1:${port}.`);
+      return;
+    }
+  }
+  throw new Error('kimi-gpt-bridge did not become healthy within 5s — check server.log.');
+}
+
+function readPidRecords() {
+  const records = [];
+  let entries = [];
+  try {
+    entries = fs.readdirSync(kgbHome());
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  for (const name of entries) {
+    const match = /^server-(\d+)\.pid$/.exec(name);
+    if (!match) continue;
+    const file = path.join(kgbHome(), name);
+    try {
+      const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (
+        record?.service === SERVICE &&
+        typeof record.version === 'string' &&
+        Number.isSafeInteger(record.pid) && record.pid > 0 &&
+        Number.isSafeInteger(record.port) && record.port > 0 && record.port <= 65535 &&
+        record.port === Number(match[1]) &&
+        typeof record.startedAt === 'string'
+      ) {
+        records.push({ ...record, file, legacy: false });
+      } else {
+        console.log(`Ignoring invalid PID record ${file}.`);
+      }
+    } catch {
+      console.log(`Ignoring invalid PID record ${file}.`);
+    }
+  }
+  const legacyFile = path.join(kgbHome(), 'server.pid');
+  if (fs.existsSync(legacyFile)) {
+    const pid = Number(fs.readFileSync(legacyFile, 'utf8').trim());
+    if (Number.isSafeInteger(pid) && pid > 0) {
+      records.push({ pid, file: legacyFile, legacy: true });
+    } else {
+      console.log(`Ignoring invalid legacy PID record ${legacyFile}; it was left in place.`);
+    }
+  }
+  return records;
+}
+
+function pidIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (err.code === 'ESRCH') return false;
+    return true;
   }
 }
 
-async function cmdTeardown(flags) {
-  const pidFile = path.join(kgbHome(), 'server.pid');
-  if (fs.existsSync(pidFile)) {
-    const pid = Number(fs.readFileSync(pidFile, 'utf8').trim());
-    if (pid) {
-      try {
-        process.kill(pid, 0); // alive?
-        process.kill(pid, 'SIGTERM');
-        console.log(`Stopped bridge server (pid ${pid}).`);
-      } catch {
-        console.log(`Server pid ${pid} is not running.`);
-      }
+function removeMatchingPidRecord(record) {
+  try {
+    const current = JSON.parse(fs.readFileSync(record.file, 'utf8'));
+    if (
+      current?.service === record.service &&
+      current?.pid === record.pid &&
+      current?.port === record.port
+    ) {
+      fs.rmSync(record.file);
+      return true;
     }
-    try { fs.rmSync(pidFile); } catch { /* best effort */ }
-  } else {
-    console.log('No server.pid found — server is probably not running.');
+  } catch (err) {
+    if (err.code !== 'ENOENT') return false;
   }
+  return false;
+}
+
+async function waitForPidExit(pid, timeoutMs = 1500) {
+  const deadline = Date.now() + timeoutMs;
+  while (pidIsAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return !pidIsAlive(pid);
+}
+
+async function stopPidRecord(record) {
+  if (record.legacy) {
+    console.log(
+      `Did not stop pid ${record.pid} from legacy ${path.basename(record.file)} — ownership cannot be safely confirmed; the record was left in place.`,
+    );
+    return { status: 'retained', record };
+  }
+
+  const health = await healthy(record.port, 1000, { pid: record.pid });
+  if (!health) {
+    if (!pidIsAlive(record.pid)) {
+      removeMatchingPidRecord(record);
+      console.log(`Removed stale PID record for exited bridge pid ${record.pid} on port ${record.port}.`);
+      return { status: 'stale', record };
+    }
+    console.log(
+      `Did not stop pid ${record.pid} from ${path.basename(record.file)} — bridge health identity/pid did not match on port ${record.port}; the PID record was left in place.`,
+    );
+    return { status: 'retained', record };
+  }
+
+  try {
+    process.kill(record.pid, 'SIGTERM');
+  } catch (err) {
+    if (err.code !== 'ESRCH') throw err;
+  }
+  if (await waitForPidExit(record.pid)) {
+    removeMatchingPidRecord(record);
+    console.log(`Stopped bridge server on port ${record.port} (pid ${record.pid}).`);
+    return { status: 'stopped', record };
+  }
+  console.log(
+    `Signalled bridge pid ${record.pid} on port ${record.port}, but it is still running; the PID record was left in place.`,
+  );
+  return { status: 'retained', record };
+}
+
+async function cmdTeardown(flags) {
+  const records = readPidRecords();
+  if (!records.length) console.log('No bridge PID records found — server is probably not running.');
+  const stopResults = [];
+  for (const record of records) stopResults.push(await stopPidRecord(record));
 
   const configFile = kimiConfigPath();
   if (fs.existsSync(configFile)) {
     const content = fs.readFileSync(configFile, 'utf8');
-    const hasBridgeEntries =
-      content.includes(MARKER_START) ||
-      /^\s*\[providers\.(?:"kimi-gpt-bridge"|kimi-gpt-bridge)/m.test(content) ||
-      /^\s*\[models\."chatgpt\//m.test(content);
-    if (hasBridgeEntries) {
-      const remaining = stripBridgeTables(content);
-      fs.writeFileSync(configFile, remaining);
+    const remaining = stripBridgeTables(content);
+    if (remaining !== content) {
+      writeKimiConfig(configFile, remaining);
       console.log(`Removed the kimi-gpt-bridge block from ${configFile}`);
-      const stale = [];
-      const dm = remaining.match(/^default_model\s*=\s*"([^"]+)"/m);
-      if (dm && dm[1].startsWith('chatgpt/')) stale.push(`default_model = "${dm[1]}"`);
-      const sm = remaining.match(/^\[secondary_model\][\s\S]*?default_model\s*=\s*"([^"]+)"/m);
-      if (sm && sm[1].startsWith('chatgpt/')) stale.push(`[secondary_model] default_model = "${sm[1]}"`);
-      for (const key of remaining.matchAll(/^\s*"(chatgpt\/[^"]+)"\s*=/gm)) stale.push(`[secondary_model.models] entry "${key[1]}"`);
+      const stale = readTomlModelReferences(configFile);
       if (stale.length) {
         console.log('\n*** WARNING ***');
         console.log('These settings still reference chatgpt/... models that no longer exist:');
-        for (const s of stale) console.log(`  - ${s}`);
+        for (const reference of stale) console.log(`  - ${describeModelReference(reference)}`);
         console.log('Kimi Code fails startup validation on unresolved model references.');
         console.log('Edit config.toml or use `/model` (and `/secondary-model`) to pick other models.');
       }
@@ -434,14 +647,22 @@ async function cmdTeardown(flags) {
   }
 
   if (flags.purge) {
-    fs.rmSync(kgbHome(), { recursive: true, force: true });
-    console.log(`Deleted ${kgbHome()} (credentials and logs).`);
+    if (stopResults.some((result) => result.status === 'retained')) {
+      console.log(`Did not delete ${kgbHome()} because one or more PID records could not be safely stopped.`);
+    } else {
+      fs.rmSync(kgbHome(), { recursive: true, force: true });
+      console.log(`Deleted ${kgbHome()} (credentials and logs).`);
+    }
   }
   console.log('\nTo finish uninstalling, run `/plugins remove kimi-gpt-bridge` in Kimi Code, then `/reload`.');
 }
 
 function cmdProxy(args) {
   const arg = args[0];
+  if (arg === '--help' || arg === '-h') {
+    console.log(USAGE);
+    return;
+  }
   const config = loadConfig();
   if (!arg) {
     const { proxy, source } = describeProxy();
@@ -458,13 +679,13 @@ function cmdProxy(args) {
       return;
     }
     delete config.proxy;
-    saveConfig(config);
+    saveProxyConfig(config);
     console.log('Proxy removed from config.');
     return;
   }
   config.proxy = arg;
-  saveConfig(config);
-  console.log(`Proxy saved to config (${arg}): the bridge server will use it automatically.`);
+  saveProxyConfig(config);
+  console.log(`Proxy saved to config (${redactProxyUrl(arg)}): the bridge server will use it automatically.`);
 }
 
 async function main() {
@@ -516,7 +737,7 @@ async function main() {
       await cmdStatus();
       break;
     case 'logout':
-      cmdLogout();
+      await cmdLogout();
       break;
     case 'setup':
       await cmdSetup();
@@ -534,7 +755,17 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(`Error: ${err.message}`);
-  process.exit(1);
-});
+let isMain = false;
+if (process.argv[1]) {
+  try {
+    isMain = fs.realpathSync(process.argv[1]) === fs.realpathSync(CLI_PATH);
+  } catch {
+    isMain = path.resolve(process.argv[1]) === CLI_PATH;
+  }
+}
+if (isMain) {
+  main().catch((err) => {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  });
+}

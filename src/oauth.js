@@ -135,8 +135,8 @@ export async function exchangeCode(code, codeVerifier, redirectUri, fetchImpl = 
   };
 }
 
-export async function refreshTokens(refreshToken, fetchImpl = fetch) {
-  const res = await fetchImpl(TOKEN_URL, {
+export async function refreshTokens(refreshToken, fetchImpl = fetch, signal) {
+  const request = fetchImpl(TOKEN_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -144,8 +144,11 @@ export async function refreshTokens(refreshToken, fetchImpl = fetch) {
       refresh_token: refreshToken,
       client_id: CLIENT_ID,
     }).toString(),
+    signal,
   });
-  const data = await parseJsonBody(res);
+  const res = signal ? await waitWithSignal(request, signal) : await request;
+  const body = parseJsonBody(res);
+  const data = signal ? await waitWithSignal(body, signal) : await body;
   if (!res.ok) throw tokenEndpointError(data, res, 'Token refresh');
   return {
     access: data.access_token,
@@ -170,31 +173,64 @@ export async function requestDeviceCode(fetchImpl = fetch) {
   };
 }
 
-// Polls for device authorization. 403/404 or `deviceauth_authorization_pending`
-// means keep polling; `slow_down` increases the interval by 5s; overall timeout 900s.
-export async function pollDeviceToken({ deviceAuthId, userCode, interval }, { fetchImpl = fetch, timeoutMs = 900_000, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
-  const deadline = Date.now() + timeoutMs;
-  let currentInterval = interval;
-  while (Date.now() < deadline) {
-    await sleep(currentInterval * 1000);
-    const res = await fetchImpl(DEVICE_TOKEN_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ device_auth_id: deviceAuthId, user_code: userCode }),
-    });
-    const data = await parseJsonBody(res);
-    if (res.ok && data?.authorization_code) {
-      return { authorizationCode: data.authorization_code, codeVerifier: data.code_verifier };
-    }
-    const errCode = data?.error?.code ?? (typeof data?.error === 'string' ? data.error : undefined);
-    if (errCode === 'slow_down') {
-      currentInterval += 5;
-      continue;
-    }
-    if (res.status === 403 || res.status === 404 || errCode === 'deviceauth_authorization_pending') {
-      continue;
-    }
-    throw tokenEndpointError(data, res, 'Device authorization');
+function formatDuration(ms) {
+  if (ms % 60_000 === 0) {
+    const minutes = ms / 60_000;
+    return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`;
   }
-  throw new Error('Device authorization timed out after 15 minutes.');
+  if (ms % 1000 === 0) {
+    const seconds = ms / 1000;
+    return `${seconds} ${seconds === 1 ? 'second' : 'seconds'}`;
+  }
+  return `${ms} ${ms === 1 ? 'millisecond' : 'milliseconds'}`;
+}
+
+function waitWithSignal(promise, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+  });
+}
+
+// Polls for device authorization. 403/404 or `deviceauth_authorization_pending`
+// means keep polling; `slow_down` increases the interval by 5s. One deadline
+// covers sleeps, fetch, and response body reads.
+export async function pollDeviceToken({ deviceAuthId, userCode, interval }, { fetchImpl = fetch, timeoutMs = 900_000, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
+  const timeoutError = new Error(`Device authorization timed out after ${formatDuration(timeoutMs)}.`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(timeoutError), Math.max(0, timeoutMs));
+  let currentInterval = interval;
+  try {
+    while (true) {
+      await waitWithSignal(sleep(currentInterval * 1000), controller.signal);
+      const res = await waitWithSignal(fetchImpl(DEVICE_TOKEN_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ device_auth_id: deviceAuthId, user_code: userCode }),
+        signal: controller.signal,
+      }), controller.signal);
+      const data = await waitWithSignal(parseJsonBody(res), controller.signal);
+      if (res.ok && data?.authorization_code) {
+        return { authorizationCode: data.authorization_code, codeVerifier: data.code_verifier };
+      }
+      const errCode = data?.error?.code ?? (typeof data?.error === 'string' ? data.error : undefined);
+      if (errCode === 'slow_down') {
+        currentInterval += 5;
+        continue;
+      }
+      if (res.status === 403 || res.status === 404 || errCode === 'deviceauth_authorization_pending') {
+        continue;
+      }
+      throw tokenEndpointError(data, res, 'Device authorization');
+    }
+  } catch (err) {
+    if (controller.signal.aborted) throw timeoutError;
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }

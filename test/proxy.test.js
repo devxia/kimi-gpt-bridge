@@ -5,7 +5,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { configPath, loadConfig, saveConfig, resolveProxy } from '../src/proxy.js';
+import {
+  configPath,
+  loadConfig,
+  saveConfig,
+  resolveProxy,
+  describeProxy,
+  redactProxyUrl,
+  mergeNoProxy,
+  shouldReexecWithProxy,
+  reexecExitCode,
+} from '../src/proxy.js';
 
 const CLI_PATH = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 
@@ -70,6 +80,40 @@ test('resolveProxy: persisted config wins over HTTPS_PROXY env', () => {
   saveConfig({ proxy: 'http://127.0.0.1:PORT' });
   process.env.HTTPS_PROXY = 'http://127.0.0.1:8080';
   assert.equal(resolveProxy(), 'http://127.0.0.1:PORT');
+});
+
+test('redactProxyUrl hides proxy credentials and describeProxy uses it', () => {
+  const proxy = 'http://alice:s3cr3t@proxy.example:8080';
+  process.env.KGB_PROXY = proxy;
+  const redacted = redactProxyUrl(proxy);
+  assert.equal(redacted, 'http://***:***@proxy.example:8080/');
+  assert.equal(describeProxy().proxy, redacted);
+  assert.doesNotMatch(describeProxy().proxy, /alice|s3cr3t/);
+});
+
+test('mergeNoProxy preserves existing entries and ensures local callbacks bypass proxy', () => {
+  assert.equal(mergeNoProxy('example.com,10.0.0.0/8'), 'example.com,10.0.0.0/8,localhost,127.0.0.1');
+  assert.equal(mergeNoProxy('LOCALHOST,127.0.0.1'), 'LOCALHOST,127.0.0.1');
+  assert.equal(mergeNoProxy(), 'localhost,127.0.0.1');
+});
+
+test('shouldReexecWithProxy requires the exact bootstrapped proxy environment', () => {
+  const proxy = 'http://proxy.example:8080';
+  assert.equal(shouldReexecWithProxy(proxy, {}), true);
+  assert.equal(shouldReexecWithProxy(proxy, { NODE_USE_ENV_PROXY: 'true', HTTPS_PROXY: proxy, HTTP_PROXY: proxy }), true);
+  assert.equal(shouldReexecWithProxy(proxy, { NODE_USE_ENV_PROXY: '1', HTTPS_PROXY: proxy, HTTP_PROXY: 'http://other' }), true);
+  assert.equal(shouldReexecWithProxy(proxy, { NODE_USE_ENV_PROXY: '1', HTTPS_PROXY: proxy, HTTP_PROXY: proxy }), false);
+  assert.equal(shouldReexecWithProxy(proxy, { KGB_REEXEC: '1' }), false);
+  assert.equal(shouldReexecWithProxy(null, {}), false);
+});
+
+test('reexecExitCode never treats spawn failures or signals as success', () => {
+  assert.equal(reexecExitCode({ status: 0 }), 0);
+  assert.equal(reexecExitCode({ status: 7 }), 7);
+  assert.notEqual(reexecExitCode({ status: 0, signal: 'SIGTERM' }), 0);
+  assert.notEqual(reexecExitCode({ status: 0, error: new Error('spawn failed') }), 0);
+  assert.notEqual(reexecExitCode({ status: null, signal: 'SIGTERM' }), 0);
+  assert.notEqual(reexecExitCode({ status: null, signal: null, error: new Error('spawn failed') }), 0);
 });
 
 test('proxy subcommand: bare reports none on a fresh home', () => {
