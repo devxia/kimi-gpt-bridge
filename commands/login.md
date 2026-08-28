@@ -7,7 +7,7 @@ Run the bridge's OAuth login flow:
 1. Run this as a foreground Bash command with a timeout of at least 930 seconds. The CLI waits up to 10 minutes for browser OAuth; the device flow waits up to 15 minutes.
 
    ```bash
-   node "$KIMI_CODE_HOME/plugins/managed/kimi-gpt-bridge/src/cli.js" login
+   node "${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/kimi-gpt-bridge/src/cli.js" login
    ```
 
    If that path does not exist, locate the kimi-gpt-bridge checkout (look for `src/cli.js`) and run the same command there.
@@ -19,7 +19,7 @@ Run the bridge's OAuth login flow:
 4. If no browser is available or port 1455 cannot be bound, re-run the following foreground command with the same timeout of at least 930 seconds:
 
    ```bash
-   node "$KIMI_CODE_HOME/plugins/managed/kimi-gpt-bridge/src/cli.js" login --device
+   node "${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/kimi-gpt-bridge/src/cli.js" login --device
    ```
 
    Device login works on headless machines and expires after 15 minutes.

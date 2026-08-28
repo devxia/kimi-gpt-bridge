@@ -7,7 +7,7 @@ Refresh the ChatGPT models registered in Kimi Code's `config.toml`:
 1. Run this Bash command. It requires Python 3.11+ with `tomllib` for independent candidate-config validation.
 
    ```bash
-   node "$KIMI_CODE_HOME/plugins/managed/kimi-gpt-bridge/src/cli.js" models sync
+   node "${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/kimi-gpt-bridge/src/cli.js" models sync
    ```
 
    If that path does not exist, locate the kimi-gpt-bridge checkout and run the same `models sync` command there.

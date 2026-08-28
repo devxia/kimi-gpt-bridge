@@ -7,7 +7,7 @@ Configure Kimi Code to use the bridge:
 1. Run this Bash command. It requires Python 3.11+ with `tomllib` to validate the complete candidate config before replacement.
 
    ```bash
-   node "$KIMI_CODE_HOME/plugins/managed/kimi-gpt-bridge/src/cli.js" setup
+   node "${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/kimi-gpt-bridge/src/cli.js" setup
    ```
 
    If that path does not exist, locate the kimi-gpt-bridge checkout and run `src/cli.js setup` there.

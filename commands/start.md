@@ -7,7 +7,7 @@ Start the bridge server:
 1. Run this Bash command. It uses `KGB_PORT`, defaulting to 1456.
 
    ```bash
-   node "$KIMI_CODE_HOME/plugins/managed/kimi-gpt-bridge/src/cli.js" ensure-running
+   node "${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/kimi-gpt-bridge/src/cli.js" ensure-running
    ```
 
    If that path does not exist, locate the kimi-gpt-bridge checkout and run `src/cli.js ensure-running` there.

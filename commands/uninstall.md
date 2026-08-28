@@ -9,13 +9,13 @@ Uninstall the bridge:
 2. Run this Bash command. Removing bridge tables requires Python 3.11+ with `tomllib` to validate the candidate config before replacement.
 
    ```bash
-   node "$KIMI_CODE_HOME/plugins/managed/kimi-gpt-bridge/src/cli.js" teardown
+   node "${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/kimi-gpt-bridge/src/cli.js" teardown
    ```
 
    or, with credential deletion:
 
    ```bash
-   node "$KIMI_CODE_HOME/plugins/managed/kimi-gpt-bridge/src/cli.js" teardown --purge
+   node "${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/kimi-gpt-bridge/src/cli.js" teardown --purge
    ```
 
    If that path does not exist, locate the kimi-gpt-bridge repo checkout and run `src/cli.js teardown` from there.

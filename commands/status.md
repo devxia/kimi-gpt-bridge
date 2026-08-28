@@ -7,7 +7,7 @@ Check the bridge status:
 1. Run this Bash command:
 
    ```bash
-   node "$KIMI_CODE_HOME/plugins/managed/kimi-gpt-bridge/src/cli.js" status
+   node "${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/kimi-gpt-bridge/src/cli.js" status
    ```
 
    If that path does not exist, locate the kimi-gpt-bridge repo checkout and run `src/cli.js status` from there.
