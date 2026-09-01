@@ -138,6 +138,20 @@ function isAdjacentToolContinuation(messages, assistantIndex, callIds) {
   return expected.size === actual.size && [...expected].every((id) => actual.has(id));
 }
 
+// Extract tool-call IDs from the last assistant turn only if they are followed
+// by an adjacent, complete tool continuation (all tool messages, every call ID
+// answered exactly once). This is the condition under which encrypted reasoning
+// cache entries remain valid and should be attached.
+function latestToolCallsIfAdjacent(messages) {
+  const lastAssistantIndex = messages.findLastIndex((m) => m?.role === 'assistant');
+  if (lastAssistantIndex < 0) return [];
+  const toolCalls = Array.isArray(messages[lastAssistantIndex]?.tool_calls)
+    ? messages[lastAssistantIndex].tool_calls
+    : [];
+  const callIds = toolCalls.map((tc) => tc?.id).filter(Boolean);
+  return isAdjacentToolContinuation(messages, lastAssistantIndex, callIds) ? callIds : [];
+}
+
 function reasoningGroups(rawItems, callIds) {
   const groupsByCallIds = new Map();
   for (const raw of rawItems) {
@@ -171,15 +185,7 @@ export function chatRequestToResponsesBody(req, { promptCacheKey, reasoningCache
 
   const instructionParts = [];
   const input = [];
-  const lastAssistantIndex = messages.findLastIndex?.((message) => message?.role === 'assistant') ?? -1;
-  const latestToolCalls =
-    lastAssistantIndex >= 0 && Array.isArray(messages[lastAssistantIndex]?.tool_calls)
-      ? messages[lastAssistantIndex].tool_calls
-      : [];
-  const latestCallIds =
-    lastAssistantIndex >= 0 && isAdjacentToolContinuation(messages, lastAssistantIndex, latestToolCalls.map((tc) => tc?.id).filter(Boolean))
-      ? latestToolCalls.map((tc) => tc?.id).filter(Boolean)
-      : [];
+  const latestCallIds = latestToolCallsIfAdjacent(messages);
   pruneReasoningCache(cacheKey, latestCallIds);
 
   for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
@@ -340,10 +346,15 @@ function sseData(rawEvent) {
 
 // Parses an upstream SSE stream (`data: {json}` lines, event type inside the
 // JSON `type` field) into event objects.
+const MAX_SSE_BUFFER_BYTES = 1024 * 1024; // 1 MiB
+
 export async function* parseResponsesSSE(stream) {
   let buffer = '';
   for await (const chunk of readChunks(stream)) {
     buffer += chunk;
+    if (buffer.length > MAX_SSE_BUFFER_BYTES) {
+      throw new Error(`SSE buffer exceeded ${MAX_SSE_BUFFER_BYTES} bytes without a complete event — upstream may not be sending blank lines.`);
+    }
     for (;;) {
       const separator = buffer.match(/\r\n\r\n|\r\r|\n\n/);
       if (!separator) break;
@@ -358,7 +369,16 @@ export async function* parseResponsesSSE(stream) {
 
   // Accept a final complete data event even if the upstream omitted its blank line.
   const data = sseData(buffer);
-  if (data != null && data !== '[DONE]') yield JSON.parse(data);
+  if (data != null && data !== '[DONE]') {
+    try {
+      yield JSON.parse(data);
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        throw new Error(`Upstream connection closed with incomplete SSE event (${buffer.length} bytes in buffer) — expected a terminal response event before EOF.`);
+      }
+      throw err;
+    }
+  }
 }
 
 function usageOf(u) {

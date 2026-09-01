@@ -186,6 +186,60 @@ test('callUpstream refreshes after one 401 and retries with the new token', asyn
   assert.equal(refreshCalls, 1);
 });
 
+// The discarded 401 body pins its socket until GC otherwise.
+test('callUpstream cancels the discarded 401 body before retrying', async () => {
+  const newAccess = fakeJwt();
+  let cancelled = 0;
+  let upstreamCalls = 0;
+
+  const fetchImpl = async (url) => {
+    if (url === 'https://upstream.invalid/codex/responses') {
+      upstreamCalls += 1;
+      if (upstreamCalls === 1) {
+        return {
+          ...mockResponse(401),
+          body: { cancel: async () => { cancelled += 1; } },
+        };
+      }
+      return mockResponse(200);
+    }
+    if (url === 'https://auth.openai.com/oauth/token') {
+      return mockResponse(200, { access_token: newAccess, refresh_token: 'new-refresh', expires_in: 3600 });
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  const response = await callUpstream({ model: 'gpt-test' }, { sessionId: 'sess-cancel', fetchImpl });
+  assert.equal(response.status, 200);
+  assert.equal(cancelled, 1, 'the 401 response body was not cancelled');
+});
+
+test('callUpstream retries even when cancelling the 401 body fails', async () => {
+  const newAccess = fakeJwt();
+  let upstreamCalls = 0;
+
+  const fetchImpl = async (url) => {
+    if (url === 'https://upstream.invalid/codex/responses') {
+      upstreamCalls += 1;
+      if (upstreamCalls === 1) {
+        return {
+          ...mockResponse(401),
+          body: { cancel: async () => { throw new Error('already locked'); } },
+        };
+      }
+      return mockResponse(200);
+    }
+    if (url === 'https://auth.openai.com/oauth/token') {
+      return mockResponse(200, { access_token: newAccess, refresh_token: 'new-refresh', expires_in: 3600 });
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  const response = await callUpstream({ model: 'gpt-test' }, { sessionId: 'sess-cancel-fail', fetchImpl });
+  assert.equal(response.status, 200);
+  assert.equal(upstreamCalls, 2);
+});
+
 test('callUpstream surfaces a second 401 without refreshing again', async () => {
   const newAccess = fakeJwt();
   let upstreamCalls = 0;

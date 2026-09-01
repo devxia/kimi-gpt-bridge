@@ -493,53 +493,6 @@ function parseTomlAssignmentStringValue(lines, lineIndex, assignment) {
   return parseTomlStringValue(assignment.text, assignment.valueStart);
 }
 
-// Returns display-ready descriptions of config settings which still reference
-// chatgpt/... models. This source scanner covers table, dotted-key, and multiline
-// string forms, but intentionally does not try to decode inline tables. CLI code
-// making write/refusal decisions must use a real tomllib parse as its authority;
-// this helper should supplement that result with readable source descriptions.
-export function findChatgptModelReferences(text) {
-  const references = [];
-  let tablePath = [];
-  let multiline = null;
-  const lines = String(text ?? '').replace(/\r\n/g, '\n').split('\n');
-  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-    const line = lines[lineIndex];
-    const startsInsideMultiline = multiline !== null;
-    multiline = tomlMultilineStateAfterLine(line, multiline);
-    if (startsInsideMultiline) continue;
-    const header = parseTomlTableHeader(line);
-    if (header) {
-      tablePath = header;
-      continue;
-    }
-    const assignment = parseTomlAssignment(line);
-    if (!assignment) continue;
-    const fullPath = [...tablePath, ...assignment.pathParts];
-    if (fullPath.length === 1 && fullPath[0] === 'default_model') {
-      const model = parseTomlAssignmentStringValue(lines, lineIndex, assignment);
-      if (model?.startsWith('chatgpt/')) references.push(`default_model = ${JSON.stringify(model)}`);
-    } else if (
-      fullPath.length === 2 &&
-      fullPath[0] === 'secondary_model' &&
-      fullPath[1] === 'default_model'
-    ) {
-      const model = parseTomlAssignmentStringValue(lines, lineIndex, assignment);
-      if (model?.startsWith('chatgpt/')) {
-        references.push(`[secondary_model] default_model = ${JSON.stringify(model)}`);
-      }
-    } else if (
-      fullPath.length === 3 &&
-      fullPath[0] === 'secondary_model' &&
-      fullPath[1] === 'models' &&
-      fullPath[2].startsWith('chatgpt/')
-    ) {
-      references.push(`[secondary_model.models] entry ${JSON.stringify(fullPath[2])}`);
-    }
-  }
-  return references;
-}
-
 // Idempotent install of the marker block: strip every existing bridge entry
 // (marked or hoisted-out-of-markers by Kimi Code rewrites), then append the
 // fresh block at the END so it stays valid TOML.

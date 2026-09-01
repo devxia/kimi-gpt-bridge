@@ -14,6 +14,7 @@ import {
   redactProxyUrl,
   mergeNoProxy,
   shouldReexecWithProxy,
+  proxyChildEnv,
   reexecExitCode,
 } from '../src/proxy.js';
 
@@ -105,6 +106,40 @@ test('shouldReexecWithProxy requires the exact bootstrapped proxy environment', 
   assert.equal(shouldReexecWithProxy(proxy, { NODE_USE_ENV_PROXY: '1', HTTPS_PROXY: proxy, HTTP_PROXY: proxy }), false);
   assert.equal(shouldReexecWithProxy(proxy, { KGB_REEXEC: '1' }), false);
   assert.equal(shouldReexecWithProxy(null, {}), false);
+});
+
+// undici prefers lowercase proxy vars, so an uppercase-only environment that
+// otherwise looks ready must still re-exec to get the lowercase ones removed.
+test('shouldReexecWithProxy re-execs when a lowercase proxy var could override', () => {
+  const proxy = 'http://proxy.example:8080';
+  const ready = { NODE_USE_ENV_PROXY: '1', HTTPS_PROXY: proxy, HTTP_PROXY: proxy };
+  assert.equal(shouldReexecWithProxy(proxy, { ...ready, https_proxy: 'http://stale:1' }), true);
+  assert.equal(shouldReexecWithProxy(proxy, { ...ready, http_proxy: 'http://stale:1' }), true);
+  assert.equal(shouldReexecWithProxy(proxy, { ...ready, no_proxy: 'example.com' }), true);
+  // Same spelling as the resolved proxy still counts: uppercase must be the
+  // single source of truth, and NO_PROXY merging only happens via re-exec.
+  assert.equal(shouldReexecWithProxy(proxy, { ...ready, https_proxy: proxy }), true);
+});
+
+test('proxyChildEnv drops lowercase proxy vars so the resolved proxy wins', () => {
+  const proxy = 'http://proxy.example:8080';
+  const env = proxyChildEnv(proxy, {
+    PATH: '/usr/bin',
+    https_proxy: 'http://stale:1',
+    http_proxy: 'http://stale:1',
+    no_proxy: 'example.com',
+  });
+  assert.equal(env.HTTPS_PROXY, proxy);
+  assert.equal(env.HTTP_PROXY, proxy);
+  assert.equal(env.NODE_USE_ENV_PROXY, '1');
+  assert.equal(env.KGB_REEXEC, '1');
+  assert.equal(env.PATH, '/usr/bin');
+  assert.ok(!('https_proxy' in env));
+  assert.ok(!('http_proxy' in env));
+  assert.ok(!('no_proxy' in env));
+  // A lowercase no_proxy is still honored as input to the merge, just not
+  // passed through as a competing key.
+  assert.equal(env.NO_PROXY, 'example.com,localhost,127.0.0.1');
 });
 
 test('reexecExitCode never treats spawn failures or signals as success', () => {

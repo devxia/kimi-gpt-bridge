@@ -7,6 +7,7 @@ import { refreshTokens, extractAccountInfo } from './oauth.js';
 
 const LOCK_WAIT_TIMEOUT_MS = 15_000;
 const LOCK_STALE_MS = 120_000;
+const LOCK_MAX_AGE_MS = 7 * 24 * 3600_000; // 7 days, hard upper bound for PID reuse edge case
 const LOCK_RETRY_MS = 25;
 const lockStates = new Map();
 
@@ -70,7 +71,17 @@ function recoverLockFile(file) {
     throw err;
   }
   const validPid = Number.isSafeInteger(owner.pid) && owner.pid > 0;
-  if (validPid && processIsAlive(owner.pid)) return false;
+  if (validPid && processIsAlive(owner.pid)) {
+    // Even when the PID is alive, reclaim locks older than the hard maximum age.
+    // This bounds the worst-case leak from PID reuse: an unrelated long-lived
+    // process inheriting the old lock PID cannot hold it forever.
+    const createdAt = Number.isFinite(owner.time) ? owner.time : modifiedAt;
+    if (Date.now() - createdAt > LOCK_MAX_AGE_MS) {
+      try { fs.rmSync(file); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+      return true;
+    }
+    return false;
+  }
   const createdAt = Number.isFinite(owner.time) ? owner.time : modifiedAt;
   if (!validPid && Date.now() - createdAt <= LOCK_STALE_MS) return false;
   try {

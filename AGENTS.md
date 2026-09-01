@@ -19,6 +19,8 @@ Kimi Code re-serializes `config.toml` on some writes: it **hoists `[providers.*]
 - Keep the **32 MiB** request-body cap on generation routes. Return a bounded client error rather than buffering without limit.
 - Chat SSE must reach `response.completed` or `response.incomplete` before `[DONE]`; streamed Responses must also observe an explicit terminal event. EOF is an error, and early downstream termination must cancel the upstream request/body.
 - Lifecycle state is **port-scoped**. Do not reuse a PID record across `KGB_PORT` values, and verify the `/health` service identity before trusting or killing a recorded PID.
+- An absent PID record does not mean nothing is running—records get hand-deleted or predate a version. `teardown --purge` must probe the configured port for a live bridge before deleting `KGB_HOME`, or it removes credentials from under a running server.
+- Ports must be validated where they enter (`--port`, `KGB_PORT`). An unvalidated `NaN` reaches `server.listen()` or, worse, makes `ensure-running` spawn a child that dies instantly and get reported as "did not become healthy"—blaming the server for a typo.
 - Kimi Code runs the managed copy (`~/.kimi-code/plugins/managed/kimi-gpt-bridge/`). Editing this checkout does not update an installed plugin.
 - Slash commands are prompts that invoke Bash, not code. Hooks must always exit 0. Login waits 10 minutes for browser OAuth and 15 minutes for device authorization, so slash-command Bash timeouts must be at least **930 seconds**.
 - `/plugins remove` leaves the managed copy on disk; uninstall guidance must account for it.
@@ -29,7 +31,11 @@ Node fetch reads `NODE_USE_ENV_PROXY` / `HTTPS_PROXY` at process startup. Keep t
 
 Proxy order is `KGB_PROXY` → persisted `config.json` → `HTTPS_PROXY`/`HTTP_PROXY`. A macOS system proxy is invisible to terminal processes and still needs `kimi-gpt-bridge proxy <url>`. Any proxy shown in logs or CLI output must redact username/password userinfo.
 
-Browser login succeeding while token exchange reports `Country, region, or territory not supported` or `fetch failed` means the terminal path cannot reach OpenAI. Configure the proxy instead of repeating login.
+**undici prefers lowercase `https_proxy` / `http_proxy` / `no_proxy` over their uppercase spelling.** Ignoring the lowercase vars does not make them harmless: an inherited one silently wins over the resolved proxy, so the CLI reports the configured value while traffic goes elsewhere, and a lowercase `no_proxy` defeats the `localhost,127.0.0.1` merge that keeps `/health` probes off the proxy. The re-exec child env must therefore **delete** all three lowercase keys (`proxyChildEnv`), and `shouldReexecWithProxy` must treat their presence as "not yet bootstrapped"—otherwise an environment that already looks ready skips the re-exec and never gets cleaned.
+
+`persistLogin` captures a shell proxy so later sessions inherit it, but it cannot identify one by value: after the re-exec, `HTTPS_PROXY` always equals `resolveProxy()`. Gate on **source** instead—skip the capture when `KGB_PROXY` is set (a deliberate one-shot override) and never overwrite an existing `config.json` entry. Gating on `KGB_REEXEC` instead would disable the capture entirely, since login always re-execs when a proxy resolves.
+
+Browser login succeeding while token exchange reports `Country, region, or territory not supported` or `fetch failed` means the terminal path cannot reach OpenAI. Configure the proxy instead of repeating login. A 2xx carrying non-JSON belongs to the same class (captive portal / interception page): token endpoints must name that cause instead of dereferencing a null body.
 
 ## Upstream and authentication facts that bite
 
@@ -47,3 +53,5 @@ Browser login succeeding while token exchange reports `Country, region, or terri
 - `npm test` must stay fully offline: inject `fetchImpl`, isolate `KGB_HOME`/`KIMI_CODE_HOME`, and never contact OpenAI or ChatGPT.
 - Config-writing tests must invoke a real TOML parse; generated text that merely looks valid is insufficient.
 - Cover request limits, exact local bearer auth, stream/non-stream defaults, terminal SSE/error cancellation, cross-process refresh/logout locking, invalid-reference refusal, port-scoped PID identity, proxy redaction, and `max` effort behavior.
+- Also cover the failure modes above: lowercase proxy vars losing to the resolved proxy, non-JSON 2xx from token endpoints, malformed `--port`/`KGB_PORT`, and `teardown --purge` facing a live bridge with no PID record.
+- Cover resource cleanup: SSE buffer overflow, incomplete JSON at EOF, 401 body cancellation, browser callback keep-alive termination, `promptLine` EOF handling, Python parser timeout, server error listener, SIGHUP shutdown, logStream close on timeout path, and 7-day lock reclaim.

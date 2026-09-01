@@ -26,9 +26,14 @@ export function saveConfig(config) {
   try { fs.chmodSync(dir, 0o700); } catch { /* best effort */ }
   const file = configPath();
   const tmp = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, file);
-  try { fs.chmodSync(file, 0o600); } catch { /* best effort */ }
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    try { fs.chmodSync(file, 0o600); } catch { /* best effort */ }
+  } catch (err) {
+    try { fs.rmSync(tmp); } catch { /* ignore cleanup failure */ }
+    throw err;
+  }
 }
 
 // Conventional shell proxy env vars, honored so users with a proxied shell
@@ -74,12 +79,18 @@ export function mergeNoProxy(noProxy = '') {
 
 // Pure predicate exported so callers can inspect re-exec behavior without
 // spawning a child process or exiting the current one.
+// Lowercase proxy vars must be absent: undici prefers them over the uppercase
+// spelling, so leaving one in place would silently override the resolved proxy
+// even when every uppercase var already matches.
 export function shouldReexecWithProxy(proxy, env = process.env) {
   if (!proxy || env.KGB_REEXEC === '1') return false;
   return !(
     env.NODE_USE_ENV_PROXY === '1' &&
     env.HTTPS_PROXY === proxy &&
-    env.HTTP_PROXY === proxy
+    env.HTTP_PROXY === proxy &&
+    !env.https_proxy &&
+    !env.http_proxy &&
+    !env.no_proxy
   );
 }
 
@@ -102,19 +113,30 @@ export function reexecExitCode(child) {
 // NODE_USE_ENV_PROXY/HTTPS_PROXY inside a running process is too late (undici
 // reads them at bootstrap), so we re-exec the same CLI with the env prepared.
 // KGB_REEXEC only guards the child from a second re-exec.
+// undici prefers lowercase proxy vars over their uppercase spelling, so an
+// inherited lowercase var would win over the values set here. Drop them and
+// keep uppercase as the single source of truth.
+export function proxyChildEnv(proxy, env = process.env) {
+  const childEnv = {
+    ...env,
+    NODE_USE_ENV_PROXY: '1',
+    HTTPS_PROXY: proxy,
+    HTTP_PROXY: proxy,
+    NO_PROXY: mergeNoProxy(env.NO_PROXY ?? env.no_proxy),
+    KGB_REEXEC: '1',
+  };
+  delete childEnv.https_proxy;
+  delete childEnv.http_proxy;
+  delete childEnv.no_proxy;
+  return childEnv;
+}
+
 export function reexecWithProxyIfNeeded(scriptPath) {
   const proxy = resolveProxy();
   if (!shouldReexecWithProxy(proxy)) return;
   const child = spawnSync(process.execPath, [scriptPath, ...process.argv.slice(2)], {
     stdio: 'inherit',
-    env: {
-      ...process.env,
-      NODE_USE_ENV_PROXY: '1',
-      HTTPS_PROXY: proxy,
-      HTTP_PROXY: proxy,
-      NO_PROXY: mergeNoProxy(process.env.NO_PROXY ?? process.env.no_proxy),
-      KGB_REEXEC: '1',
-    },
+    env: proxyChildEnv(proxy),
   });
   process.exit(reexecExitCode(child));
 }

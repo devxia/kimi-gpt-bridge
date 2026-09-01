@@ -10,6 +10,8 @@ import {
   parseManualInput,
   extractAccountInfo,
   refreshTokens,
+  exchangeCode,
+  requestDeviceCode,
   pollDeviceToken,
 } from '../src/oauth.js';
 
@@ -18,6 +20,16 @@ function jsonResponse(status, data) {
     ok: status >= 200 && status < 300,
     status,
     text: async () => JSON.stringify(data),
+  };
+}
+
+// What a captive portal / intercepting proxy actually returns: HTTP 200 with
+// an HTML page instead of the token JSON.
+function htmlResponse(status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => '<!DOCTYPE html><html><body>Access denied by network policy</body></html>',
   };
 }
 
@@ -98,6 +110,94 @@ test('JWT account info extraction: email from profile claim fallback', () => {
   const info = extractAccountInfo(token);
   assert.equal(info.email, 'p@example.com');
   assert.equal(info.accountId, 'acct_x');
+});
+
+// A 2xx carrying an interception page must name the likely cause, not throw a
+// TypeError on a null body. AGENTS.md records this exact failure mode: browser
+// login succeeds while the terminal path cannot reach OpenAI.
+test('token endpoints report a non-JSON 2xx as network interception', async () => {
+  const cases = [
+    ['Token exchange', () => exchangeCode('code', 'verifier', REDIRECT_URI, async () => htmlResponse())],
+    ['Token refresh', () => refreshTokens('refresh-token', async () => htmlResponse())],
+    ['Device code request', () => requestDeviceCode(async () => htmlResponse())],
+  ];
+  for (const [what, call] of cases) {
+    await assert.rejects(call, (err) => {
+      assert.equal(err.code, 'non_json_response');
+      assert.equal(err.status, 200);
+      assert.match(err.message, new RegExp(`^${what} failed:`));
+      assert.match(err.message, /auth\.openai\.com/);
+      assert.match(err.message, /kimi-gpt-bridge proxy/);
+      // Must not be the pre-fix TypeError on a null body.
+      assert.ok(!(err instanceof TypeError));
+      return true;
+    });
+  }
+});
+
+test('token endpoints reject valid JSON that omits the expected field', async () => {
+  await assert.rejects(
+    exchangeCode('code', 'verifier', REDIRECT_URI, async () => jsonResponse(200, { expires_in: 3600 })),
+    (err) => {
+      assert.equal(err.code, 'incomplete_response');
+      assert.match(err.message, /did not include access_token/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    refreshTokens('refresh-token', async () => jsonResponse(200, { refresh_token: 'r2' })),
+    (err) => {
+      assert.equal(err.code, 'incomplete_response');
+      assert.match(err.message, /did not include access_token/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    requestDeviceCode(async () => jsonResponse(200, { device_auth_id: 'd1' })),
+    (err) => {
+      assert.equal(err.code, 'incomplete_response');
+      assert.match(err.message, /did not include user_code/);
+      return true;
+    },
+  );
+});
+
+test('a non-JSON error response still reports the upstream status', async () => {
+  await assert.rejects(
+    refreshTokens('refresh-token', async () => htmlResponse(502)),
+    (err) => {
+      // !res.ok is handled before the payload check, so this stays a
+      // tokenEndpointError carrying the real status.
+      assert.equal(err.status, 502);
+      assert.match(err.message, /Token refresh failed: HTTP 502/);
+      return true;
+    },
+  );
+});
+
+test('exchangeCode sends the PKCE verifier and redirect URI, and rotates in the refresh token', async () => {
+  let sent;
+  const tokens = await exchangeCode('the-code', 'the-verifier', REDIRECT_URI, async (url, options) => {
+    sent = { url, body: new URLSearchParams(options.body) };
+    return jsonResponse(200, { access_token: 'a1', refresh_token: 'r1', expires_in: 60 });
+  });
+  assert.equal(sent.url, 'https://auth.openai.com/oauth/token');
+  assert.equal(sent.body.get('grant_type'), 'authorization_code');
+  assert.equal(sent.body.get('client_id'), CLIENT_ID);
+  assert.equal(sent.body.get('code'), 'the-code');
+  assert.equal(sent.body.get('code_verifier'), 'the-verifier');
+  assert.equal(sent.body.get('redirect_uri'), REDIRECT_URI);
+  assert.equal(tokens.access, 'a1');
+  assert.equal(tokens.refresh, 'r1');
+  assert.ok(tokens.expires > Date.now());
+});
+
+test('requestDeviceCode returns the user code and defaults a missing interval to 5', async () => {
+  const dc = await requestDeviceCode(async () => jsonResponse(200, {
+    device_auth_id: 'dev-1',
+    user_code: 'ABCD-1234',
+  }));
+  assert.deepEqual(dc, { deviceAuthId: 'dev-1', userCode: 'ABCD-1234', interval: 5 });
 });
 
 test('refreshTokens passes AbortSignal and escapes a fetch that ignores it', async () => {

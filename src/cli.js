@@ -64,6 +64,17 @@ Environment:
   KGB_PROXY            Proxy URL for outbound requests (overrides config.json)
 `;
 
+// A bad --port must fail here: an unvalidated NaN reaches server.listen() or,
+// worse, ensure-running, where it spawns a child that dies instantly and gets
+// reported as "did not become healthy" — pointing at the wrong cause.
+export function parsePort(raw) {
+  const value = Number(raw);
+  if (raw === undefined || String(raw).trim() === '' || !Number.isInteger(value) || value < 0 || value > 65535) {
+    throw new Error(`Invalid --port value: ${raw ?? '(missing)'} — expected an integer between 0 and 65535.`);
+  }
+  return value;
+}
+
 function parseFlags(args) {
   const flags = {};
   for (let i = 0; i < args.length; i++) {
@@ -71,8 +82,8 @@ function parseFlags(args) {
     if (a === '--device') flags.device = true;
     else if (a === '--purge') flags.purge = true;
     else if (a === '--help' || a === '-h') flags.help = true;
-    else if (a === '--port') flags.port = Number(args[++i]);
-    else if (a.startsWith('--port=')) flags.port = Number(a.slice('--port='.length));
+    else if (a === '--port') flags.port = parsePort(args[++i]);
+    else if (a.startsWith('--port=')) flags.port = parsePort(a.slice('--port='.length));
     else throw new Error(`Unknown option: ${a}`);
   }
   return flags;
@@ -121,7 +132,7 @@ function saveProxyConfig(config) {
 
 function promptLine(question) {
   process.stdout.write(question);
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let buf = '';
     process.stdin.resume();
     process.stdin.setEncoding('utf8');
@@ -131,10 +142,16 @@ function promptLine(question) {
       if (idx >= 0) {
         process.stdin.pause();
         process.stdin.off('data', onData);
+        process.stdin.off('end', onEnd);
         resolve(buf.slice(0, idx).trim());
       }
     };
+    const onEnd = () => {
+      process.stdin.off('data', onData);
+      reject(new Error('stdin closed before input was received'));
+    };
     process.stdin.on('data', onData);
+    process.stdin.once('end', onEnd);
   });
 }
 
@@ -160,31 +177,36 @@ function waitForCallback(expectedState, timeoutMs = 600_000) {
     const finish = (fn, value) => {
       clearTimeout(timer);
       server.close();
+      // Keep-alive connections left open would block exit; force-close them.
+      // closeAllConnections() is available since Node 18.2.
+      if (typeof server.closeAllConnections === 'function') {
+        server.closeAllConnections();
+      }
       fn(value);
     };
 
     const server = http.createServer((req, res) => {
       const url = new URL(req.url, `http://${CALLBACK_HOST}:${CALLBACK_PORT}`);
       if (url.pathname !== '/auth/callback') {
-        res.writeHead(404, { 'content-type': 'text/plain' });
+        res.writeHead(404, { 'content-type': 'text/plain', connection: 'close' });
         res.end('not found');
         return;
       }
       const code = url.searchParams.get('code');
       const state = url.searchParams.get('state');
       if (!code) {
-        res.writeHead(400, { 'content-type': 'text/html' });
+        res.writeHead(400, { 'content-type': 'text/html', connection: 'close' });
         res.end(ERROR_PAGE('Missing authorization code in the redirect.'));
         finish(reject, new Error('Missing authorization code in the redirect.'));
         return;
       }
       if (state !== expectedState) {
-        res.writeHead(400, { 'content-type': 'text/html' });
+        res.writeHead(400, { 'content-type': 'text/html', connection: 'close' });
         res.end(ERROR_PAGE('State mismatch.'));
         finish(reject, new Error('State mismatch in the OAuth callback.'));
         return;
       }
-      res.writeHead(200, { 'content-type': 'text/html' });
+      res.writeHead(200, { 'content-type': 'text/html', connection: 'close' });
       res.end(SUCCESS_PAGE);
       finish(resolve, code);
     });
@@ -212,11 +234,15 @@ export function persistLogin(tokens) {
   saveAuth(auth);
   console.log(`\nLogged in as ${info.email ?? 'unknown'} (plan: ${info.planType ?? 'unknown'}).`);
   console.log(`Credentials saved to ${path.join(kgbHome(), 'auth.json')}`);
-  // If login only worked because a proxy env var was set, persist it so the
-  // bridge server (and future logins) use it automatically via re-exec.
-  const usedProxy = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-  if (usedProxy) {
-    const config = loadConfig();
+  // If login only worked because a shell proxy env var was set, persist it so
+  // the bridge server (and future logins) pick it up automatically via re-exec.
+  // Note the env vars here may have been injected by our own re-exec, where
+  // HTTPS_PROXY always equals resolveProxy() — so KGB_PROXY (a deliberate
+  // one-shot override) and an existing config entry must both win over this,
+  // or a temporary override would silently become stored config.
+  const config = loadConfig();
+  const usedProxy = process.env.KGB_PROXY ? null : process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+  if (usedProxy && !config.proxy) {
     config.proxy = usedProxy;
     saveProxyConfig(config);
     console.log(`Proxy saved to config (${redactProxyUrl(usedProxy)}): the bridge server will use it automatically.`);
@@ -356,9 +382,12 @@ json.dump(references, sys.stdout)
 
 function readTomlModelReferences(file) {
   if (!fs.existsSync(file)) return [];
-  const parsed = spawnSync('python3', ['-c', TOML_REFERENCES_SCRIPT, file], { encoding: 'utf8' });
+  const parsed = spawnSync('python3', ['-c', TOML_REFERENCES_SCRIPT, file], { encoding: 'utf8', timeout: 10_000 });
   if (parsed.error) {
     throw new Error(`Could not inspect config.toml with Python tomllib: ${parsed.error.message}`);
+  }
+  if (parsed.signal) {
+    throw new Error(`Python tomllib parser was killed by signal ${parsed.signal} (timeout or interruption).`);
   }
   if (parsed.status !== 0) {
     const detail = parsed.stderr.trim().split('\n').at(-1) || `parser exited ${parsed.status}`;
@@ -647,8 +676,19 @@ async function cmdTeardown(flags) {
   }
 
   if (flags.purge) {
+    // PID records can go missing (hand-deleted, or written by an older
+    // version), which would otherwise make an empty record list look like
+    // "nothing is running" and delete credentials out from under a live
+    // server. Probe the configured port directly before removing anything.
+    const port = flags.port ?? getPort();
+    const orphan = records.some((record) => record.port === port) ? null : await healthy(port);
     if (stopResults.some((result) => result.status === 'retained')) {
       console.log(`Did not delete ${kgbHome()} because one or more PID records could not be safely stopped.`);
+    } else if (orphan) {
+      console.log(
+        `Did not delete ${kgbHome()} because a bridge server is still running on 127.0.0.1:${port} (pid ${orphan.pid}) without a PID record.`,
+      );
+      console.log(`Stop it first (kill ${orphan.pid}), then re-run teardown --purge.`);
     } else {
       fs.rmSync(kgbHome(), { recursive: true, force: true });
       console.log(`Deleted ${kgbHome()} (credentials and logs).`);

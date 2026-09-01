@@ -64,7 +64,7 @@ From then on the bridge server starts automatically with every session.
 | — | `serve [--port N]` | Run the server in the foreground (for debugging) |
 | — | `proxy [<url>\|off]` | Show / set / clear the network proxy; displayed credentials are redacted |
 | — | `logout` | Delete credentials under the same lock used by refresh |
-| `/kimi-gpt-bridge:uninstall` | `teardown [--purge]` | Stop verified bridge processes from all port-scoped PID records and remove config; `--purge` also deletes credentials |
+| `/kimi-gpt-bridge:uninstall` | `teardown [--purge]` | Stop verified bridge processes from all port-scoped PID records and remove config; `--purge` also deletes credentials, unless a bridge is still reachable on the configured port |
 
 CLI commands run as `node ~/.kimi-code/plugins/managed/kimi-gpt-bridge/src/cli.js <command>`.
 
