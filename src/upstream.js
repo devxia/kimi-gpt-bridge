@@ -28,6 +28,7 @@ export function upstreamHeaders(auth, sessionId, version = VERSION) {
 const USAGE_LIMIT_TYPES = new Set(['usage_limit_reached', 'usage_not_included', 'rate_limit_exceeded']);
 
 function humanizeReset(resetsAt) {
+  if (!Number.isFinite(resetsAt)) return '';
   const ms = resetsAt > 1e12 ? resetsAt : resetsAt * 1000;
   const mins = Math.max(1, Math.round((ms - Date.now()) / 60_000));
   return `try again in ~${mins} min`;
@@ -45,6 +46,8 @@ export async function upstreamError(res) {
   const e = data?.error ?? null;
   const nested = e && typeof e === 'object' ? e : null;
   let message = nested?.message ?? data?.message ?? data?.detail ?? (text || `HTTP ${res.status}`);
+  // A massive HTML interception page or Cloudflare error floods logs; cap it.
+  if (message.length > 500) message = message.slice(0, 500) + '…';
   const type = nested?.type ?? (typeof e === 'string' ? e : null) ?? data?.type ?? null;
   const code = nested?.code ?? data?.code ?? null;
 
@@ -79,6 +82,8 @@ export async function callUpstream(body, { sessionId, fetchImpl = fetch, signal 
   let auth = await getValidToken(fetchImpl, signal);
   let res = await postResponses(body, auth, sessionId, fetchImpl, signal);
   if (res.status === 401) {
+    // The discarded 401 body would otherwise pin its socket until GC.
+    await res.body?.cancel().catch(() => {});
     auth = await refreshNow(fetchImpl, auth, signal);
     res = await postResponses(body, auth, sessionId, fetchImpl, signal);
   }

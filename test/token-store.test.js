@@ -245,18 +245,34 @@ test('dead owners and stale locks without a valid PID are recovered', async () =
   }
 });
 
-test('an old lock owned by a live PID is never recovered by age', async () => {
+test('an old lock owned by a live PID is recovered only after the 7-day hard limit', async () => {
   const original = { access: 'old', refresh: 'r1', expires: Date.now() + 60_000, accountId: 'acct' };
   await saveAuth(original);
   const lockFile = `${authPath()}.lock`;
-  const owner = { pid: process.pid, time: 0, id: 'live-owner' };
-  fs.writeFileSync(lockFile, JSON.stringify(owner), { mode: 0o600 });
+  // A lock that is 6 days old: still below the 7-day threshold, must not be recovered.
+  const sixDaysAgo = Date.now() - 6 * 24 * 3600_000;
+  const youngOwner = { pid: process.pid, time: sixDaysAgo, id: 'young-live-owner' };
+  fs.writeFileSync(lockFile, JSON.stringify(youngOwner), { mode: 0o600 });
   const controller = new AbortController();
   const reason = new DOMException('stop waiting', 'AbortError');
-  const refresh = getValidToken(async () => assert.fail('live lock must not be recovered'), controller.signal);
+  const refresh = getValidToken(async () => ({
+    ok: true,
+    text: async () => JSON.stringify({ access_token: fakeJwt(), refresh_token: 'r2', expires_in: 3600 }),
+  }), controller.signal);
   setTimeout(() => controller.abort(reason), 50);
   await assert.rejects(refresh, (err) => err === reason);
-  assert.deepEqual(JSON.parse(fs.readFileSync(lockFile, 'utf8')), owner);
+  assert.deepEqual(JSON.parse(fs.readFileSync(lockFile, 'utf8')), youngOwner);
+
+  // A lock that is 8 days old: exceeds the 7-day hard limit, must be recovered.
+  const eightDaysAgo = Date.now() - 8 * 24 * 3600_000;
+  const oldOwner = { pid: process.pid, time: eightDaysAgo, id: 'ancient-live-owner' };
+  fs.writeFileSync(lockFile, JSON.stringify(oldOwner), { mode: 0o600 });
+  const refreshed = await getValidToken(async () => ({
+    ok: true,
+    text: async () => JSON.stringify({ access_token: fakeJwt(), refresh_token: 'r3', expires_in: 3600 }),
+  }));
+  assert.equal(refreshed.refresh, 'r3');
+  assert.equal(fs.existsSync(lockFile), false, 'ancient lock was not reclaimed');
 });
 
 test('two Node processes recover one stale lock without a check-delete race', async () => {

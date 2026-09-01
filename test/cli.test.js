@@ -141,6 +141,60 @@ test('persistLogin redacts an environment proxy while storing its original value
   }
 });
 
+// The re-exec sets HTTPS_PROXY to resolveProxy(), so persistLogin cannot tell
+// a shell proxy from an injected one by value alone. A deliberate one-shot
+// KGB_PROXY override, and an existing config entry, must both survive login.
+test('persistLogin does not turn a one-shot KGB_PROXY into stored config', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-login-oneshot-'));
+  const saved = { KGB_HOME: process.env.KGB_HOME, KGB_PROXY: process.env.KGB_PROXY, HTTPS_PROXY: process.env.HTTPS_PROXY };
+  const originalWrite = process.stdout.write;
+  try {
+    process.env.KGB_HOME = tmpDir;
+    process.env.KGB_PROXY = 'http://one-shot:9999';
+    process.env.HTTPS_PROXY = 'http://one-shot:9999'; // what the re-exec injects
+    process.stdout.write = function write(_chunk, ...args) { return originalWrite.call(this, '', ...args); };
+    persistLogin({
+      access: jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct' } }),
+      refresh: 'refresh',
+      expires: Date.now() + 3600_000,
+    });
+    assert.equal(fs.existsSync(path.join(tmpDir, 'config.json')), false, 'a one-shot KGB_PROXY was persisted');
+  } finally {
+    process.stdout.write = originalWrite;
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('persistLogin never overwrites a proxy already stored in config', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-login-keep-'));
+  const saved = { KGB_HOME: process.env.KGB_HOME, HTTPS_PROXY: process.env.HTTPS_PROXY };
+  const originalWrite = process.stdout.write;
+  try {
+    process.env.KGB_HOME = tmpDir;
+    process.env.HTTPS_PROXY = 'http://from-env:1';
+    fs.mkdirSync(tmpDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(tmpDir, 'config.json'), JSON.stringify({ proxy: 'http://from-config:2' }), { mode: 0o600 });
+    process.stdout.write = function write(_chunk, ...args) { return originalWrite.call(this, '', ...args); };
+    persistLogin({
+      access: jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct' } }),
+      refresh: 'refresh',
+      expires: Date.now() + 3600_000,
+    });
+    assert.equal(JSON.parse(fs.readFileSync(path.join(tmpDir, 'config.json'), 'utf8')).proxy, 'http://from-config:2');
+  } finally {
+    process.stdout.write = originalWrite;
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('proxy --help prints help without writing config', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-proxy-help-'));
   try {
@@ -405,6 +459,91 @@ test('server shutdown preserves a replacement PID record', async () => {
     assert.deepEqual(JSON.parse(fs.readFileSync(pidFile, 'utf8')), replacement);
   } finally {
     if (pid && processIsAlive(pid)) process.kill(pid, 'SIGTERM');
+    if (blocker.listening) await closeServer(blocker);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+// An unvalidated --port became NaN and surfaced as "did not become healthy"
+// five seconds later, pointing at the server instead of the typo.
+test('a malformed --port fails immediately and names the real cause', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-bad-port-'));
+  try {
+    for (const args of [['serve', '--port', 'abc'], ['serve', '--port=abc'], ['ensure-running', '--port', '70000'], ['serve', '--port', '-1'], ['serve', '--port', '1.5'], ['serve', '--port']]) {
+      const result = runCli(tmpDir, args);
+      assert.notEqual(result.status, 0, `${args.join(' ')} was accepted`);
+      assert.match(result.stderr, /Invalid --port value/);
+      assert.doesNotMatch(result.stderr + result.stdout, /did not become healthy/);
+    }
+    const ok = runCli(tmpDir, ['serve', '--port', '0', '--help']);
+    assert.equal(ok.status, 0, ok.stderr);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('a malformed KGB_PORT is rejected instead of becoming NaN', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-bad-env-port-'));
+  try {
+    const result = runCli(tmpDir, ['ensure-running'], { KGB_PORT: 'abc' });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Invalid KGB_PORT value/);
+    assert.doesNotMatch(result.stderr + result.stdout, /did not become healthy/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+// PID records can go missing (hand-deleted, or written by an older version).
+// Purge must not read that as "nothing is running" and delete credentials from
+// under a live server.
+test('teardown --purge keeps credentials when a live bridge has no PID record', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-purge-orphan-'));
+  const blocker = http.createServer();
+  let pid;
+  try {
+    await listen(blocker);
+    const port = blocker.address().port;
+    await closeServer(blocker);
+    const started = await runCliAsync(tmpDir, ['ensure-running', '--port', String(port)]);
+    assert.equal(started.status, 0, started.stderr);
+
+    const pidFile = path.join(tmpDir, 'kgb', `server-${port}.pid`);
+    pid = JSON.parse(fs.readFileSync(pidFile, 'utf8')).pid;
+    fs.rmSync(pidFile);
+    const authFile = path.join(tmpDir, 'kgb', 'auth.json');
+    fs.writeFileSync(authFile, JSON.stringify({ access: 'a', refresh: 'r', expires: Date.now() + 60_000 }), { mode: 0o600 });
+
+    const result = await runCliAsync(tmpDir, ['teardown', '--purge'], { KGB_PORT: String(port) });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /still running on 127\.0\.0\.1:/);
+    assert.match(result.stdout, new RegExp(`pid ${pid}`));
+    assert.equal(fs.existsSync(authFile), true, 'purge deleted credentials while the bridge was live');
+    assert.equal(processIsAlive(pid), true);
+  } finally {
+    if (pid && processIsAlive(pid)) process.kill(pid, 'SIGTERM');
+    if (pid) await waitForProcessExit(pid);
+    if (blocker.listening) await closeServer(blocker);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('teardown --purge still deletes the home when nothing is listening', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-purge-clean-'));
+  const blocker = http.createServer();
+  try {
+    await listen(blocker);
+    const port = blocker.address().port;
+    await closeServer(blocker);
+    const kgbDir = path.join(tmpDir, 'kgb');
+    fs.mkdirSync(kgbDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(kgbDir, 'auth.json'), JSON.stringify({ access: 'a' }), { mode: 0o600 });
+
+    const result = await runCliAsync(tmpDir, ['teardown', '--purge'], { KGB_PORT: String(port) });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Deleted /);
+    assert.equal(fs.existsSync(kgbDir), false);
+  } finally {
     if (blocker.listening) await closeServer(blocker);
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

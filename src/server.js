@@ -24,8 +24,16 @@ const TERMINAL_RESPONSE_EVENTS = new Set([
   'response.failed',
 ]);
 
+// A malformed KGB_PORT must not become NaN: that surfaces later as an opaque
+// listen failure or a health check against http://127.0.0.1:NaN/health.
 export function getPort() {
-  return Number(process.env.KGB_PORT || 1456);
+  const raw = process.env.KGB_PORT;
+  if (raw === undefined || String(raw).trim() === '') return 1456;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0 || value > 65535) {
+    throw new Error(`Invalid KGB_PORT value: ${raw} — expected an integer between 0 and 65535.`);
+  }
+  return value;
 }
 
 function bridgeError(status, message, type = 'invalid_request_error', code = null) {
@@ -122,7 +130,7 @@ function errorBody(err, defaultType = 'server_error') {
 }
 
 function sendError(res, err) {
-  const status = err?.status ?? (err?.message?.includes('Not logged in') ? 401 : 500);
+  const status = err?.status ?? 500;
   sendJson(res, status, errorBody(err));
 }
 
@@ -149,16 +157,19 @@ function reasoningTurnPrefix(messages) {
   const toolCalls = Array.isArray(messages[assistantIndex]?.tool_calls)
     ? messages[assistantIndex].tool_calls
     : [];
-  const callIds = new Set(toolCalls.map((toolCall) => toolCall?.id).filter(Boolean));
-  const toolOutputs = messages.slice(assistantIndex + 1);
-  const outputIds = new Set(toolOutputs.map((message) => message?.tool_call_id).filter(Boolean));
-  const adjacentToolContinuation =
-    callIds.size > 0 &&
-    toolOutputs.length > 0 &&
-    toolOutputs.every((message) => message?.role === 'tool') &&
-    callIds.size === outputIds.size &&
-    [...callIds].every((callId) => outputIds.has(callId));
+  const callIds = toolCalls.map((toolCall) => toolCall?.id).filter(Boolean);
+  const adjacentToolContinuation = callIds.length > 0 && isAdjacentToolContinuation(messages, assistantIndex, callIds);
   return adjacentToolContinuation ? messages.slice(0, assistantIndex) : messages;
+}
+
+// Shared logic: check whether messages after assistantIndex are exactly the
+// tool outputs for the given callIds (same set membership, all tool-role).
+function isAdjacentToolContinuation(messages, assistantIndex, callIds) {
+  const continuation = messages.slice(assistantIndex + 1);
+  if (!continuation.length || continuation.some((m) => m?.role !== 'tool')) return false;
+  const expected = new Set(callIds);
+  const actual = new Set(continuation.map((m) => m.tool_call_id));
+  return expected.size === actual.size && [...expected].every((id) => actual.has(id));
 }
 
 function reasoningCacheKey(req, sessionId, messages) {
@@ -493,6 +504,10 @@ export async function startServer({ port = getPort(), sessionId, fetchImpl } = {
   atomicWriteFile(pidFile, JSON.stringify(record, null, 2), 0o600);
   log(`listening on 127.0.0.1:${actualPort} (pid ${process.pid})`);
 
+  // A listen-time error is already caught above; subsequent socket-layer errors
+  // need a listener or they become uncaught exceptions.
+  server.on('error', (err) => log(`server error: ${err.message}`));
+
   let shuttingDown = false;
   const cleanup = () => removeOwnedPidRecord(pidFile, record);
   const shutdown = () => {
@@ -505,12 +520,14 @@ export async function startServer({ port = getPort(), sessionId, fetchImpl } = {
     });
     setTimeout(() => {
       cleanup();
+      logStream.end();
       process.exit(0);
     }, 2000).unref();
   };
   process.on('exit', cleanup);
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  process.on('SIGHUP', shutdown);
 
   return { server, log, pidFile, record };
 }

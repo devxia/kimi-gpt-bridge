@@ -114,6 +114,28 @@ function tokenEndpointError(data, res, what) {
   return err;
 }
 
+// A 2xx that is not JSON means something answered in OpenAI's place — almost
+// always a captive portal or proxy interception page. Say so, instead of
+// letting `data.access_token` throw an opaque TypeError on null.
+function requireTokenPayload(data, res, what, field) {
+  if (!data || typeof data !== 'object') {
+    const err = new Error(
+      `${what} failed: expected JSON from ${new URL(TOKEN_URL).host}, got a non-JSON HTTP ${res.status} response. ` +
+        'Your network is likely intercepting the request — configure a proxy with `kimi-gpt-bridge proxy <url>` and retry.',
+    );
+    err.status = res.status;
+    err.code = 'non_json_response';
+    throw err;
+  }
+  if (field && !data[field]) {
+    const err = new Error(`${what} failed: response did not include ${field}.`);
+    err.status = res.status;
+    err.code = 'incomplete_response';
+    throw err;
+  }
+  return data;
+}
+
 export async function exchangeCode(code, codeVerifier, redirectUri, fetchImpl = fetch) {
   const res = await fetchImpl(TOKEN_URL, {
     method: 'POST',
@@ -128,6 +150,7 @@ export async function exchangeCode(code, codeVerifier, redirectUri, fetchImpl = 
   });
   const data = await parseJsonBody(res);
   if (!res.ok) throw tokenEndpointError(data, res, 'Token exchange');
+  requireTokenPayload(data, res, 'Token exchange', 'access_token');
   return {
     access: data.access_token,
     refresh: data.refresh_token,
@@ -150,6 +173,7 @@ export async function refreshTokens(refreshToken, fetchImpl = fetch, signal) {
   const body = parseJsonBody(res);
   const data = signal ? await waitWithSignal(body, signal) : await body;
   if (!res.ok) throw tokenEndpointError(data, res, 'Token refresh');
+  requireTokenPayload(data, res, 'Token refresh', 'access_token');
   return {
     access: data.access_token,
     // Refresh tokens rotate — always persist the new one.
@@ -166,6 +190,7 @@ export async function requestDeviceCode(fetchImpl = fetch) {
   });
   const data = await parseJsonBody(res);
   if (!res.ok) throw tokenEndpointError(data, res, 'Device code request');
+  requireTokenPayload(data, res, 'Device code request', 'user_code');
   return {
     deviceAuthId: data.device_auth_id,
     userCode: data.user_code,

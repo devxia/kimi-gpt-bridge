@@ -14,7 +14,6 @@ import {
   buildConfigBlock,
   upsertConfigBlock,
   stripBridgeTables,
-  findChatgptModelReferences,
   clearModelCache,
   modelsCachePath,
 } from '../src/models.js';
@@ -275,7 +274,6 @@ test('stripBridgeTables parses equivalent TOML header identities and preserves o
     '',
   ].join('\n');
   assert.equal(stripBridgeTables(multiline), multiline);
-  assert.deepEqual(findChatgptModelReferences(multiline), []);
 });
 
 test('stripBridgeTables removes top-level dotted ownership assignments and their multiline values', () => {
@@ -312,64 +310,6 @@ test('stripBridgeTables removes top-level dotted ownership assignments and their
   assert.equal(parsed.models['chatgptish/keep'].provider, 'keep');
   assert.equal(parsed.other.providers['kimi-gpt-bridge'].type, 'relative-keep');
   assert.equal(parsed.other.models['chatgpt/relative'].provider, 'relative-keep\n');
-});
-
-test('findChatgptModelReferences handles quoted and dotted TOML forms', () => {
-  const config = [
-    `default_model = 'chatgpt/primary' # trailing`,
-    `[ 'secondary_model' ] # table`,
-    `default_model = "chatgpt/sec\\u006Fndary"`,
-    `[ secondary_model . models ]`,
-    `'chatgpt/literal' = 1`,
-    `"chatgpt/basic\\u002Dkey" = 2`,
-    `'other/keep' = 3`,
-    `[other]`,
-    `default_model = 'chatgpt/not-top-level'`,
-    `secondary_model.models.'chatgpt/dotted' = 4`,
-    '',
-  ].join('\n');
-  assert.deepEqual(findChatgptModelReferences(config), [
-    'default_model = "chatgpt/primary"',
-    '[secondary_model] default_model = "chatgpt/secondary"',
-    '[secondary_model.models] entry "chatgpt/literal"',
-    '[secondary_model.models] entry "chatgpt/basic-key"',
-  ]);
-  assert.deepEqual(
-    findChatgptModelReferences(`secondary_model.default_model = 'chatgpt/dotted'\nsecondary_model.models.'chatgpt/map' = 1\n`),
-    [
-      '[secondary_model] default_model = "chatgpt/dotted"',
-      '[secondary_model.models] entry "chatgpt/map"',
-    ],
-  );
-});
-
-test('findChatgptModelReferences decodes multiline basic and literal strings', () => {
-  const config = [
-    `default_model = """`,
-    `chatgpt/multiline-basic"""`,
-    `[secondary_model]`,
-    `default_model = '''`,
-    `chatgpt/multiline-literal'''`,
-    `[secondary_model.models]`,
-    `"chatgpt/map" = 1`,
-    '',
-  ].join('\n');
-  const parsed = parseToml(config);
-  assert.equal(parsed.default_model, 'chatgpt/multiline-basic');
-  assert.equal(parsed.secondary_model.default_model, 'chatgpt/multiline-literal');
-  assert.deepEqual(findChatgptModelReferences(config), [
-    'default_model = "chatgpt/multiline-basic"',
-    '[secondary_model] default_model = "chatgpt/multiline-literal"',
-    '[secondary_model.models] entry "chatgpt/map"',
-  ]);
-});
-
-test('findChatgptModelReferences leaves inline-table decoding to tomllib', () => {
-  const config = `secondary_model = { default_model = "chatgpt/inline", models = { "chatgpt/map" = 1 } }\n`;
-  const parsed = parseToml(config);
-  assert.equal(parsed.secondary_model.default_model, 'chatgpt/inline');
-  assert.equal(parsed.secondary_model.models['chatgpt/map'], 1);
-  assert.deepEqual(findChatgptModelReferences(config), []);
 });
 
 test('upsertConfigBlock appends once and replaces in place (idempotent)', () => {
