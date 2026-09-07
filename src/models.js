@@ -7,7 +7,10 @@ import crypto from 'node:crypto';
 import { upstreamBase, upstreamHeaders, upstreamError } from './upstream.js';
 import { kgbHome, getValidToken } from './token-store.js';
 
-export const MODELS_CLIENT_VERSION = '0.146.0';
+// Floor for the catalog's client_version parameter. The Codex backend gates
+// new catalog entries on per-model minimal_client_version, so a stale floor
+// silently hides newly released models; resolveClientVersion() floats it.
+export const MODELS_CLIENT_VERSION = '0.153.4';
 
 export const MARKER_START = '# >>> kimi-gpt-bridge >>>';
 export const MARKER_END = '# <<< kimi-gpt-bridge <<<';
@@ -16,8 +19,32 @@ export const MARKER_END = '# <<< kimi-gpt-bridge <<<';
 // endpoint changes). Keep in sync with the current ChatGPT generation.
 export const STATIC_FALLBACK_MODELS = [
   {
+    slug: 'gpt-6-astra',
+    displayName: 'GPT-6-Astra',
+    description: '',
+    contextWindow: 272000,
+    defaultEffort: 'low',
+    efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+  },
+  {
+    slug: 'gpt-5.6-sol',
+    displayName: 'GPT-5.6-Sol',
+    description: '',
+    contextWindow: 272000,
+    defaultEffort: 'low',
+    efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+  },
+  {
     slug: 'gpt-5.6-terra',
-    displayName: 'GPT-5.6 Terra',
+    displayName: 'GPT-5.6-Terra',
+    description: '',
+    contextWindow: 272000,
+    defaultEffort: 'medium',
+    efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+  },
+  {
+    slug: 'gpt-5.6-luna',
+    displayName: 'GPT-5.6-Luna',
     description: '',
     contextWindow: 272000,
     defaultEffort: 'medium',
@@ -33,7 +60,7 @@ export const STATIC_FALLBACK_MODELS = [
   },
   {
     slug: 'gpt-5.4-mini',
-    displayName: 'GPT-5.4 Mini',
+    displayName: 'GPT-5.4-Mini',
     description: '',
     contextWindow: 272000,
     defaultEffort: 'medium',
@@ -41,10 +68,83 @@ export const STATIC_FALLBACK_MODELS = [
   },
 ];
 
+export const CLIENT_VERSION_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+const CLIENT_VERSION_REGISTRY_URL = 'https://registry.npmjs.org/@openai%2Fcodex/latest';
+
+function isVersionString(value) {
+  return typeof value === 'string' && /^\d+\.\d+\.\d+$/.test(value);
+}
+
+// Dotted-numeric compare: -1/0/1.
+export function compareClientVersions(a, b) {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i += 1) {
+    if (pa[i] !== pb[i]) return pa[i] < pb[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+function clientVersionCachePath() {
+  return path.join(kgbHome(), 'client-version-cache.json');
+}
+
+function readClientVersionCache() {
+  try {
+    const data = JSON.parse(fs.readFileSync(clientVersionCachePath(), 'utf8'));
+    if (isVersionString(data?.version) && Number.isFinite(data?.fetchedAt)) return data;
+  } catch {
+    /* no usable cache */
+  }
+  return null;
+}
+
+function saveClientVersionCache(version) {
+  try {
+    fs.mkdirSync(kgbHome(), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(clientVersionCachePath(), JSON.stringify({ fetchedAt: Date.now(), version }), { mode: 0o600 });
+  } catch {
+    /* best effort */
+  }
+}
+
+// The client version sent with catalog requests: KGB_CLIENT_VERSION override →
+// the newest @openai/codex release on the npm registry (cached for a day) →
+// the pinned floor. The result never drops below the floor, and every failure
+// mode (offline, registry error, bad payload) lands on it.
+export async function resolveClientVersion({ fetchImpl = fetch, now = Date.now() } = {}) {
+  const override = process.env.KGB_CLIENT_VERSION;
+  if (isVersionString(override)) return { version: override, source: 'override' };
+  const floor = MODELS_CLIENT_VERSION;
+  const resolved = (candidate, source) => {
+    const version = compareClientVersions(candidate, floor) > 0 ? candidate : floor;
+    return { version, source: version === floor ? 'pinned' : source };
+  };
+  const cached = readClientVersionCache();
+  if (cached && now - cached.fetchedAt < CLIENT_VERSION_CACHE_TTL_MS) {
+    return resolved(cached.version, 'registry-cache');
+  }
+  try {
+    const res = await fetchImpl(CLIENT_VERSION_REGISTRY_URL, { signal: AbortSignal.timeout(3000) });
+    if (res.ok) {
+      const data = await res.json();
+      if (isVersionString(data?.version)) {
+        saveClientVersionCache(data.version);
+        return resolved(data.version, 'registry');
+      }
+    }
+  } catch {
+    /* registry unreachable — fall through to the stale cache or the floor */
+  }
+  return cached ? resolved(cached.version, 'registry-cache') : { version: floor, source: 'pinned' };
+}
+
 // GET /codex/models with the standard auth headers; returns the raw catalog
 // (array of upstream model objects).
 export async function fetchModelCatalog(auth, fetchImpl = fetch) {
-  const res = await fetchImpl(`${upstreamBase()}/codex/models?client_version=${MODELS_CLIENT_VERSION}`, {
+  const { version } = await resolveClientVersion({ fetchImpl });
+  const res = await fetchImpl(`${upstreamBase()}/codex/models?client_version=${version}`, {
     headers: upstreamHeaders(auth, crypto.randomUUID()),
   });
   if (!res.ok) throw await upstreamError(res);

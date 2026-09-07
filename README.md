@@ -85,6 +85,9 @@ node ~/.kimi-code/plugins/managed/kimi-gpt-bridge/src/cli.js proxy http://127.0.
 
 Proxy resolution order: `KGB_PROXY` env → persisted `config.json` → `HTTPS_PROXY`/`HTTP_PROXY` env. Proxy usernames and passwords are redacted from CLI output.
 
+**A newly released ChatGPT model does not appear**
+The Codex backend gates catalog entries on a per-model `minimal_client_version`. The bridge auto-tracks the latest `@openai/codex` release for catalog requests (cached for a day, floored at the pinned version), so `models sync` picks up new models as soon as OpenAI's own CLI does. Set `KGB_CLIENT_VERSION` to pin a version yourself; `status` shows the resolved version and its source.
+
 **Server will not start**
 Check the configured port and health identity, then inspect `~/.kimi-gpt-bridge/server.log`:
 
