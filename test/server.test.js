@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { saveAuth } from '../src/token-store.js';
-import { createBridgeServer } from '../src/server.js';
+import { createBridgeServer, startServer } from '../src/server.js';
 import { STATIC_FALLBACK_MODELS } from '../src/models.js';
 import { VERSION } from '../src/upstream.js';
 
@@ -287,6 +287,45 @@ test('Responses streaming accepts a complete terminal event without a final blan
   assert.equal(await res.text(), terminal);
 });
 
+test('Responses streaming aborts a runaway upstream that never sends event separators', async () => {
+  let cancelled = false;
+  nextResponseFactory = () => new Response(new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      const chunk = encoder.encode('x'.repeat(64 * 1024));
+      let sent = 0;
+      const push = () => {
+        if (cancelled || sent > 4 * 1024 * 1024) return;
+        sent += chunk.length;
+        controller.enqueue(chunk);
+        setTimeout(push, 0);
+      };
+      push();
+    },
+    cancel() {
+      cancelled = true;
+    },
+  }), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+
+  const res = await postResponses({ model: 'gpt-5.4', input: 'hi', stream: true });
+  assert.equal(res.status, 200);
+  const body = await res.text();
+  assert.match(body, /"type":"error"|type: 'error'/);
+  assert.match(body, /SSE buffer exceeded/);
+  assert.equal(cancelled, true);
+});
+
+test('the default request-body cap is 32 MiB, rejected by Content-Length alone', async () => {
+  const res = await postResponses({ model: 'gpt-5.4', input: 'hi' }, {
+    headers: { 'content-length': String(33 * 1024 * 1024) },
+    rawBody: 'x'.repeat(33 * 1024 * 1024),
+  });
+  assert.equal(res.status, 413);
+  const body = await res.json();
+  assert.equal(body.error.code, 'request_too_large');
+  assert.match(body.error.message, /33554432/);
+});
+
 test('streaming waits for drain after response backpressure', async () => {
   const originalEmit = bridge.emit;
   let forcedBackpressure = false;
@@ -522,6 +561,8 @@ test('GET models and health remain available without generation headers', async 
 
   const health = await fetch(`${base}/health`);
   assert.equal(health.status, 200);
+  // /health identifies the service for lifecycle checks but must not expose
+  // account identity (accountId/planType/email) to any local process.
   assert.deepEqual(await health.json(), {
     ok: true,
     service: 'kimi-gpt-bridge',
@@ -529,9 +570,6 @@ test('GET models and health remain available without generation headers', async 
     pid: process.pid,
     port: bridge.address().port,
     authed: true,
-    accountId: 'acct_1',
-    planType: 'pro',
-    email: 'u@example.com',
   });
 });
 
@@ -539,4 +577,32 @@ test('unknown routes return an OpenAI-style error', async () => {
   const res = await fetch(`${base}/v1/nope`);
   assert.equal(res.status, 404);
   assert.equal((await res.json()).error.type, 'invalid_request_error');
+});
+
+// A listen-time error rejects startServer's promise, but socket-layer errors
+// after that would be uncaught exceptions without the post-listen listener.
+test('startServer logs a post-listen server error instead of crashing', async () => {
+  // startServer installs process-level signal/exit handlers; snapshot them so
+  // the ones it adds can be removed again — a stray SIGINT for the rest of the
+  // suite would otherwise exit the test runner mid-run.
+  const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+  const before = new Map([
+    ...signals.map((sig) => [sig, process.listeners(sig).slice()]),
+    ['exit', process.listeners('exit').slice()],
+  ]);
+  const { server, pidFile } = await startServer({ port: 0, fetchImpl });
+  try {
+    server.emit('error', new Error('boom'));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const logText = fs.readFileSync(path.join(tmpDir, 'server.log'), 'utf8');
+    assert.match(logText, /server error: boom/);
+  } finally {
+    await close(server);
+    fs.rmSync(pidFile, { force: true });
+    for (const [event, existing] of before) {
+      for (const listener of process.listeners(event)) {
+        if (!existing.includes(listener)) process.removeListener(event, listener);
+      }
+    }
+  }
 });

@@ -8,7 +8,19 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const SERVICE = 'kimi-gpt-bridge';
-const PORT = Number(process.env.KGB_PORT || 1456);
+
+function parsePort(raw) {
+  if (raw === undefined || String(raw).trim() === '') return 1456;
+  const value = Number(String(raw).trim());
+  if (!Number.isInteger(value) || value < 1 || value > 65535) return null;
+  return value;
+}
+
+const PORT = parsePort(process.env.KGB_PORT);
+if (PORT === null) {
+  process.stderr.write(`kimi-gpt-bridge: invalid KGB_PORT ${JSON.stringify(process.env.KGB_PORT)} (expected 1-65535); skipping auto-start\n`);
+  process.exit(0);
+}
 
 function selfDir() {
   return path.dirname(fileURLToPath(import.meta.url));

@@ -25,7 +25,8 @@ import { fileURLToPath } from 'node:url';
 import { kgbHome, loadAuth, saveAuth, deleteAuthAsync, getValidToken } from './token-store.js';
 import { startServer, getPort } from './server.js';
 import { upstreamBase, upstreamHeaders, upstreamError, VERSION } from './upstream.js';
-import { configPath, loadConfig, describeProxy, redactProxyUrl, reexecWithProxyIfNeeded } from './proxy.js';
+import { loadConfig, persistConfig, describeProxy, redactProxyUrl, reexecWithProxyIfNeeded } from './proxy.js';
+import { atomicWriteFile, pidIsAlive } from './util.js';
 import {
   STATIC_FALLBACK_MODELS,
   fetchModelCatalog,
@@ -49,9 +50,10 @@ Commands:
   serve [--port N]     Run the local OpenAI-compatible server (foreground)
   status               Show auth state and token expiry
   logout               Delete stored credentials
-  setup                Add/update the bridge provider in Kimi Code's config.toml
+  setup [--port N]     Add/update the bridge provider in Kimi Code's config.toml
                        (syncs the live model list when logged in)
-  models sync          Refresh config.toml model entries from ChatGPT
+  models sync [--port N]
+                       Refresh config.toml model entries from ChatGPT
   models list          Show the live ChatGPT model catalog (no config changes)
   ensure-running       Start the server in the background if not running
   proxy [<url>|off]    Show, set, or clear the network proxy (for login/server)
@@ -69,11 +71,13 @@ Environment:
 
 // A bad --port must fail here: an unvalidated NaN reaches server.listen() or,
 // worse, ensure-running, where it spawns a child that dies instantly and gets
-// reported as "did not become healthy" — pointing at the wrong cause.
+// reported as "did not become healthy" — pointing at the wrong cause. Port 0 is
+// rejected too: an ephemeral port can never be probed again by ensure-running
+// or recorded in the port-scoped PID file.
 export function parsePort(raw) {
   const value = Number(raw);
-  if (raw === undefined || String(raw).trim() === '' || !Number.isInteger(value) || value < 0 || value > 65535) {
-    throw new Error(`Invalid --port value: ${raw ?? '(missing)'} — expected an integer between 0 and 65535.`);
+  if (raw === undefined || String(raw).trim() === '' || !Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new Error(`Invalid --port value: ${raw ?? '(missing)'} — expected an integer between 1 and 65535.`);
   }
   return value;
 }
@@ -106,55 +110,28 @@ export function openBrowser(url, spawnImpl = spawn) {
   }
 }
 
-function atomicWriteFile(file, content, { mode, validate } = {}) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const existingMode = fs.existsSync(file) ? fs.statSync(file).mode & 0o777 : undefined;
-  const targetMode = mode ?? existingMode ?? 0o600;
-  const tmp = path.join(
-    path.dirname(file),
-    `.${path.basename(file)}.tmp-${process.pid}-${crypto.randomUUID()}`,
-  );
-  try {
-    fs.writeFileSync(tmp, content, { mode: targetMode });
-    fs.chmodSync(tmp, targetMode);
-    validate?.(tmp);
-    fs.renameSync(tmp, file);
-  } catch (err) {
-    try { fs.rmSync(tmp); } catch (cleanupErr) {
-      if (cleanupErr.code !== 'ENOENT') err.cleanupError = cleanupErr;
-    }
-    throw err;
-  }
-}
-
-function saveProxyConfig(config) {
-  fs.mkdirSync(kgbHome(), { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(kgbHome(), 0o700); } catch { /* best effort */ }
-  atomicWriteFile(configPath(), JSON.stringify(config, null, 2), { mode: 0o600 });
-}
-
-function promptLine(question) {
+export function promptLine(question, input = process.stdin) {
   process.stdout.write(question);
   return new Promise((resolve, reject) => {
     let buf = '';
-    process.stdin.resume();
-    process.stdin.setEncoding('utf8');
+    input.resume();
+    input.setEncoding('utf8');
     const onData = (d) => {
       buf += d;
       const idx = buf.indexOf('\n');
       if (idx >= 0) {
-        process.stdin.pause();
-        process.stdin.off('data', onData);
-        process.stdin.off('end', onEnd);
+        input.pause();
+        input.off('data', onData);
+        input.off('end', onEnd);
         resolve(buf.slice(0, idx).trim());
       }
     };
     const onEnd = () => {
-      process.stdin.off('data', onData);
+      input.off('data', onData);
       reject(new Error('stdin closed before input was received'));
     };
-    process.stdin.on('data', onData);
-    process.stdin.once('end', onEnd);
+    input.on('data', onData);
+    input.once('end', onEnd);
   });
 }
 
@@ -170,21 +147,24 @@ const ERROR_PAGE = (msg) => `<!doctype html><html><head><title>kimi-gpt-bridge</
 
 // Waits for the OAuth redirect on 127.0.0.1:1455 (port is allow-listed upstream).
 // Rejects with err.code === 'CALLBACK_BIND_FAILED' if the port cannot be bound.
-function waitForCallback(expectedState, timeoutMs = 600_000) {
+export function waitForCallback(expectedState, timeoutMs = 600_000) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      server.close();
-      reject(new Error('Timed out waiting for the login callback (10 minutes).'));
-    }, timeoutMs);
-
-    const finish = (fn, value) => {
-      clearTimeout(timer);
+    const forceClose = () => {
       server.close();
       // Keep-alive connections left open would block exit; force-close them.
       // closeAllConnections() is available since Node 18.2.
       if (typeof server.closeAllConnections === 'function') {
         server.closeAllConnections();
       }
+    };
+    const timer = setTimeout(() => {
+      forceClose();
+      reject(new Error('Timed out waiting for the login callback (10 minutes).'));
+    }, timeoutMs);
+
+    const finish = (fn, value) => {
+      clearTimeout(timer);
+      forceClose();
       fn(value);
     };
 
@@ -216,6 +196,7 @@ function waitForCallback(expectedState, timeoutMs = 600_000) {
 
     server.once('error', (err) => {
       clearTimeout(timer);
+      forceClose();
       const bindErr = new Error(`Could not bind ${CALLBACK_HOST}:${CALLBACK_PORT}: ${err.message}`);
       bindErr.code = 'CALLBACK_BIND_FAILED';
       reject(bindErr);
@@ -247,7 +228,7 @@ export function persistLogin(tokens) {
   const usedProxy = process.env.KGB_PROXY ? null : process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
   if (usedProxy && !config.proxy) {
     config.proxy = usedProxy;
-    saveProxyConfig(config);
+    persistConfig(config);
     console.log(`Proxy saved to config (${redactProxyUrl(usedProxy)}): the bridge server will use it automatically.`);
   }
 }
@@ -415,14 +396,61 @@ function describeModelReference({ setting, model }) {
   return `[secondary_model.models] entry ${JSON.stringify(model)}`;
 }
 
+const PROVIDER_BASE_URL_SCRIPT = String.raw`
+import sys, tomllib
+with open(sys.argv[1], "rb") as file:
+    config = tomllib.load(file)
+provider = config.get("providers", {}).get("kimi-gpt-bridge")
+base = provider.get("base_url") if isinstance(provider, dict) else None
+print(base or "")
+`;
+
+// Best-effort read of the port currently written into the bridge provider's
+// base_url. Returns null when there is no provider, no base_url, or the file
+// cannot be parsed — callers fall back to the default.
+function readBridgeProviderPort(configFile) {
+  if (!fs.existsSync(configFile)) return null;
+  const parsed = spawnSync('python3', ['-c', PROVIDER_BASE_URL_SCRIPT, configFile], {
+    encoding: 'utf8',
+    timeout: 10_000,
+  });
+  if (parsed.error || parsed.signal || parsed.status !== 0) return null;
+  try {
+    const url = new URL(parsed.stdout.trim());
+    const port = Number(url.port);
+    if ((url.hostname === '127.0.0.1' || url.hostname === 'localhost') &&
+        Number.isInteger(port) && port >= 1 && port <= 65535) {
+      return port;
+    }
+  } catch {
+    /* not a URL we wrote */
+  }
+  return null;
+}
+
+// The written base_url must keep pointing at the port the user configured:
+// explicit --port wins, then an explicitly-set KGB_PORT (where the server now
+// runs), then the port already in config.toml, then the default. Without the
+// existing-config step, `models sync` (or a plain `setup`) would silently
+// rewrite a `setup --port N` provider back to the default port.
+function resolveWritePort(explicitPort) {
+  if (explicitPort != null) return explicitPort;
+  const raw = process.env.KGB_PORT;
+  if (raw !== undefined && String(raw).trim() !== '') return getPort();
+  return readBridgeProviderPort(kimiConfigPath()) ?? 1456;
+}
+
 function validateTomlFile(file) {
   const parsed = spawnSync(
     'python3',
     ['-c', 'import sys, tomllib\nwith open(sys.argv[1], "rb") as f: tomllib.load(f)', file],
-    { encoding: 'utf8' },
+    { encoding: 'utf8', timeout: 10_000 },
   );
   if (parsed.error) {
     throw new Error(`Could not validate config.toml with Python tomllib: ${parsed.error.message}`);
+  }
+  if (parsed.signal) {
+    throw new Error(`Python tomllib validation was killed by signal ${parsed.signal} (timeout or interruption).`);
   }
   if (parsed.status !== 0) {
     const detail = parsed.stderr.trim().split('\n').at(-1) || `parser exited ${parsed.status}`;
@@ -434,8 +462,7 @@ function writeKimiConfig(configFile, content) {
   atomicWriteFile(configFile, content, { validate: validateTomlFile });
 }
 
-function writeConfigBlock(models) {
-  const port = getPort();
+function writeConfigBlock(models, port = getPort()) {
   const configFile = kimiConfigPath();
   const existing = fs.existsSync(configFile) ? fs.readFileSync(configFile, 'utf8') : '';
   const available = new Set(models.map((model) => `chatgpt/${model.slug}`));
@@ -452,9 +479,9 @@ function writeConfigBlock(models) {
   return { configFile, replacing };
 }
 
-async function cmdSetup() {
+async function cmdSetup(flags = {}) {
   const models = await resolveModels();
-  const { configFile, replacing } = writeConfigBlock(models);
+  const { configFile, replacing } = writeConfigBlock(models, resolveWritePort(flags.port));
   console.log(`${replacing ? 'Updated' : 'Added'} the kimi-gpt-bridge provider in ${configFile}`);
   console.log('\nNext steps:');
   console.log('  1. Run `/reload` in Kimi Code.');
@@ -464,13 +491,35 @@ async function cmdSetup() {
 
 function printModelLine(m) {
   const efforts = m.efforts?.length ? m.efforts.join('/') : 'default';
-  console.log(`  ${m.slug}  default: ${m.defaultEffort ?? '?'}  efforts: ${efforts}  ctx: ${m.contextWindow ?? '?'}`);
+  const label = m.displayName ? `${m.slug}  ${m.displayName}` : m.slug;
+  console.log(`  ${label}  default: ${m.defaultEffort ?? '?'}  efforts: ${efforts}  ctx: ${m.contextWindow ?? '?'}`);
+}
+
+function parseModelsFlags(args) {
+  const flags = {};
+  const positional = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--port') flags.port = parsePort(args[++i]);
+    else if (a.startsWith('--port=')) flags.port = parsePort(a.slice('--port='.length));
+    else if (a.startsWith('--')) throw new Error(`Unknown option: ${a}`);
+    else positional.push(a);
+  }
+  flags.positional = positional;
+  return flags;
 }
 
 async function cmdModels(args) {
-  const sub = args[0];
+  let flags;
+  try {
+    flags = parseModelsFlags(args);
+  } catch (err) {
+    console.error(err.message);
+    process.exit(2);
+  }
+  const sub = flags.positional[0];
   if (sub !== 'sync' && sub !== 'list') {
-    console.error('Usage: kimi-gpt-bridge models <sync|list>');
+    console.error('Usage: kimi-gpt-bridge models <sync|list> [--port N]');
     process.exit(2);
   }
   const auth = await getValidToken();
@@ -479,11 +528,11 @@ async function cmdModels(args) {
 
   if (sub === 'list') {
     console.log(`ChatGPT model catalog (plan: ${auth.planType ?? 'unknown'}):`);
-    for (const m of models) console.log(`  ${m.slug}  ${m.displayName}  default: ${m.defaultEffort ?? '?'}  efforts: ${m.efforts.join('/') || 'default'}  ctx: ${m.contextWindow ?? '?'}`);
+    for (const m of models) printModelLine(m);
     return;
   }
 
-  const { configFile, replacing } = writeConfigBlock(models);
+  const { configFile, replacing } = writeConfigBlock(models, resolveWritePort(flags.port));
   saveModelsCache(models.map((m) => m.slug));
   console.log(`${replacing ? 'Updated' : 'Added'} ${models.length} models in ${configFile}:`);
   for (const m of models) printModelLine(m);
@@ -580,16 +629,6 @@ function readPidRecords() {
     }
   }
   return records;
-}
-
-function pidIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    if (err.code === 'ESRCH') return false;
-    return true;
-  }
 }
 
 function removeMatchingPidRecord(record) {
@@ -724,12 +763,12 @@ function cmdProxy(args) {
       return;
     }
     delete config.proxy;
-    saveProxyConfig(config);
+    persistConfig(config);
     console.log('Proxy removed from config.');
     return;
   }
   config.proxy = arg;
-  saveProxyConfig(config);
+  persistConfig(config);
   console.log(`Proxy saved to config (${redactProxyUrl(arg)}): the bridge server will use it automatically.`);
 }
 
@@ -785,7 +824,7 @@ async function main() {
       await cmdLogout();
       break;
     case 'setup':
-      await cmdSetup();
+      await cmdSetup(flags);
       break;
     case 'ensure-running':
       await cmdEnsureRunning(flags);

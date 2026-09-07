@@ -335,3 +335,28 @@ test('429 reset metadata is recognized across top-level and nested error fields'
     assert.match(err.message, /try again in ~10 min/);
   }
 });
+
+test('429 surfaces resets_at regardless of the error code allowlist', async () => {
+  const resetsAt = Math.floor((Date.now() + 600_000) / 1000);
+  // plan_type alongside a recognized usage-limit code: the plan label is appended.
+  const labeled = await upstreamError(mockResponse(429, {
+    error: { message: 'limit hit', type: 'usage_limit_reached', resets_at: resetsAt, plan_type: 'plus' },
+  }));
+  assert.match(labeled.message, /try again in ~10 min/);
+  assert.match(labeled.message, /\(plan: plus\)/);
+  // The same plan_type under an unrecognized code: reset timing still passes
+  // through, but the plan label stays off.
+  const unlabeled = await upstreamError(mockResponse(429, {
+    error: { message: 'throttled', type: 'server_busy', code: 'overloaded', resets_at: resetsAt, plan_type: 'plus' },
+  }));
+  assert.equal(unlabeled.status, 429);
+  assert.match(unlabeled.message, /try again in ~10 min/);
+  assert.doesNotMatch(unlabeled.message, /\(plan:/);
+});
+
+test('429 without resets_at leaves the message untouched', async () => {
+  const err = await upstreamError(mockResponse(429, {
+    error: { message: 'throttled', type: 'server_busy' },
+  }));
+  assert.equal(err.message, 'throttled');
+});
