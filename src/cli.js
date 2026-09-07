@@ -29,6 +29,7 @@ import { configPath, loadConfig, describeProxy, redactProxyUrl, reexecWithProxyI
 import {
   STATIC_FALLBACK_MODELS,
   fetchModelCatalog,
+  resolveClientVersion,
   selectModels,
   buildConfigBlock,
   upsertConfigBlock,
@@ -62,6 +63,8 @@ Environment:
   KGB_PORT             Server port (default 1456)
   KGB_UPSTREAM_BASE    Upstream API base (default https://chatgpt.com/backend-api)
   KGB_PROXY            Proxy URL for outbound requests (overrides config.json)
+  KGB_CLIENT_VERSION   Client version for model-catalog requests (default: track
+                       the latest @openai/codex release, floored at the pinned one)
 `;
 
 // A bad --port must fail here: an unvalidated NaN reaches server.listen() or,
@@ -296,6 +299,8 @@ async function cmdServe(flags) {
 }
 
 async function cmdStatus() {
+  const clientVersion = await resolveClientVersion();
+  console.log(`Client version: ${clientVersion.version} (${clientVersion.source})`);
   const auth = loadAuth();
   if (!auth) {
     console.log('Not logged in. Run `kimi-gpt-bridge login` to connect your ChatGPT account.');

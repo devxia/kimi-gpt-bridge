@@ -9,7 +9,10 @@ import {
   MARKER_START,
   MARKER_END,
   STATIC_FALLBACK_MODELS,
+  MODELS_CLIENT_VERSION,
+  CLIENT_VERSION_CACHE_TTL_MS,
   fetchModelCatalog,
+  resolveClientVersion,
   selectModels,
   buildConfigBlock,
   upsertConfigBlock,
@@ -337,13 +340,16 @@ test('fetchModelCatalog GETs the catalog endpoint with auth headers', async () =
     return new Response(JSON.stringify({ models: CATALOG }), { status: 200 });
   };
   process.env.KGB_UPSTREAM_BASE = 'https://example.test/backend-api';
+  // Pin the override so the registry lookup is skipped and calls[0] is the catalog.
+  process.env.KGB_CLIENT_VERSION = MODELS_CLIENT_VERSION;
   try {
     const catalog = await fetchModelCatalog({ access: 'tok', accountId: 'acct_1' }, fetchImpl);
     assert.equal(catalog.length, CATALOG.length);
   } finally {
     delete process.env.KGB_UPSTREAM_BASE;
+    delete process.env.KGB_CLIENT_VERSION;
   }
-  assert.equal(calls[0].url, 'https://example.test/backend-api/codex/models?client_version=0.146.0');
+  assert.equal(calls[0].url, `https://example.test/backend-api/codex/models?client_version=${MODELS_CLIENT_VERSION}`);
   assert.equal(calls[0].headers.authorization, 'Bearer tok');
   assert.equal(calls[0].headers['chatgpt-account-id'], 'acct_1');
   assert.equal(calls[0].headers.originator, 'kimi-gpt-bridge');
@@ -379,6 +385,9 @@ test('GET /v1/models serves the live catalog and falls back on failure', async (
   // Dynamic: stubbed fetch answers the catalog endpoint.
   clearModelCache();
   const catalogFetch = async (url) => {
+    // The client-version registry probe shares fetchImpl; answer it with a
+    // version-less payload so resolution lands on the pinned floor.
+    if (url.includes('registry.npmjs.org')) return new Response('{}', { status: 200 });
     assert.match(url, /\/codex\/models\?client_version=/);
     return new Response(JSON.stringify({ models: CATALOG }), { status: 200 });
   };
@@ -445,4 +454,94 @@ test('setup appends then replaces the marker block idempotently', () => {
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+// --- client version resolution: override → registry tracking → pinned floor ---
+
+function withIsolatedKgbHome(t) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-version-test-'));
+  process.env.KGB_HOME = tmpDir;
+  t.after(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.KGB_HOME;
+  });
+}
+
+test('resolveClientVersion: KGB_CLIENT_VERSION override wins without any fetch', async (t) => {
+  withIsolatedKgbHome(t);
+  process.env.KGB_CLIENT_VERSION = '9.9.9';
+  t.after(() => delete process.env.KGB_CLIENT_VERSION);
+  const resolved = await resolveClientVersion({
+    fetchImpl: async () => {
+      throw new Error('must not fetch');
+    },
+  });
+  assert.deepEqual(resolved, { version: '9.9.9', source: 'override' });
+});
+
+test('resolveClientVersion: a malformed KGB_CLIENT_VERSION is ignored', async (t) => {
+  withIsolatedKgbHome(t);
+  process.env.KGB_CLIENT_VERSION = 'nightly';
+  t.after(() => delete process.env.KGB_CLIENT_VERSION);
+  const resolved = await resolveClientVersion({
+    fetchImpl: async () => {
+      throw new Error('offline');
+    },
+  });
+  assert.deepEqual(resolved, { version: MODELS_CLIENT_VERSION, source: 'pinned' });
+});
+
+test('resolveClientVersion tracks a newer registry release, then serves it from cache', async (t) => {
+  withIsolatedKgbHome(t);
+  let fetches = 0;
+  const registryFetch = async () => {
+    fetches += 1;
+    return new Response(JSON.stringify({ version: '9.9.9' }), { status: 200 });
+  };
+  const resolved = await resolveClientVersion({ fetchImpl: registryFetch });
+  assert.deepEqual(resolved, { version: '9.9.9', source: 'registry' });
+
+  // Fresh cache: no further registry call.
+  const cached = await resolveClientVersion({
+    fetchImpl: async () => {
+      throw new Error('must not fetch');
+    },
+  });
+  assert.deepEqual(cached, { version: '9.9.9', source: 'registry-cache' });
+  assert.equal(fetches, 1);
+
+  // Stale cache still beats the floor when the registry is unreachable.
+  const stale = await resolveClientVersion({
+    fetchImpl: async () => {
+      throw new Error('offline');
+    },
+    now: Date.now() + CLIENT_VERSION_CACHE_TTL_MS + 1,
+  });
+  assert.deepEqual(stale, { version: '9.9.9', source: 'registry-cache' });
+});
+
+test('resolveClientVersion never drops below the pinned floor', async (t) => {
+  withIsolatedKgbHome(t);
+  const older = await resolveClientVersion({
+    fetchImpl: async () => new Response(JSON.stringify({ version: '0.1.0' }), { status: 200 }),
+  });
+  assert.deepEqual(older, { version: MODELS_CLIENT_VERSION, source: 'pinned' });
+});
+
+test('resolveClientVersion falls back to the floor on registry errors and bad payloads', async (t) => {
+  withIsolatedKgbHome(t);
+  const offline = await resolveClientVersion({
+    fetchImpl: async () => {
+      throw new Error('offline');
+    },
+  });
+  assert.deepEqual(offline, { version: MODELS_CLIENT_VERSION, source: 'pinned' });
+  const httpError = await resolveClientVersion({
+    fetchImpl: async () => new Response('nope', { status: 500 }),
+  });
+  assert.deepEqual(httpError, { version: MODELS_CLIENT_VERSION, source: 'pinned' });
+  const badPayload = await resolveClientVersion({
+    fetchImpl: async () => new Response(JSON.stringify({ latest: '9.9.9' }), { status: 200 }),
+  });
+  assert.deepEqual(badPayload, { version: MODELS_CLIENT_VERSION, source: 'pinned' });
 });

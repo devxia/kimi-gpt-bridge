@@ -41,6 +41,7 @@ Browser login succeeding while token exchange reports `Country, region, or terri
 
 - **Refresh tokens rotate**. Persist each replacement and serialize refresh across Node processes with the auth-file lock. Logout/auth deletion must use the same mutation lock so it cannot race an in-flight refresh.
 - Use catalog `context_window`, not `max_context_window`; over-declaring causes compaction after the subscription path's accepted window.
+- Catalog entries carry a per-model `minimal_client_version` gate: a stale pinned `MODELS_CLIENT_VERSION` silently hides new generations (gpt-6-astra required ≥ 0.153.0 while 0.146.0 was pinned). `resolveClientVersion` floats the catalog version — `KGB_CLIENT_VERSION` override → npm `@openai/codex` latest (24h cache in `client-version-cache.json`) → pinned floor — and never goes below the floor. Tests pin the env override or stub the registry call; never hardcode a version in URL expectations.
 - `ultra`, `off`, and `none` stay filtered. `max` is a supported effort and must remain accepted in catalog config, explicit `reasoning_effort`, and model suffix parsing.
 - OAuth callback port **1455** is allow-listed and fixed. Browser callback timeout is 10 minutes; device polling timeout is 15 minutes.
 - Upstream request shape is mandatory: `store:false, stream:true, include:["reasoning.encrypted_content"]`. Preserve supported tool-selection/parallel-call constraints.
