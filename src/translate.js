@@ -130,7 +130,7 @@ function pruneReasoningCache(cacheKey, allowedCallIds = []) {
   }
 }
 
-function isAdjacentToolContinuation(messages, assistantIndex, callIds) {
+export function isAdjacentToolContinuation(messages, assistantIndex, callIds) {
   const continuation = messages.slice(assistantIndex + 1);
   if (!continuation.length || continuation.some((m) => m?.role !== 'tool')) return false;
   const expected = new Set(callIds);
@@ -336,7 +336,7 @@ export async function* readChunks(source) {
   if (tail) yield tail;
 }
 
-function sseData(rawEvent) {
+export function sseData(rawEvent) {
   const dataLines = [];
   for (const line of rawEvent.split(/\r\n|\r|\n/)) {
     if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
@@ -346,15 +346,23 @@ function sseData(rawEvent) {
 
 // Parses an upstream SSE stream (`data: {json}` lines, event type inside the
 // JSON `type` field) into event objects.
-const MAX_SSE_BUFFER_BYTES = 1024 * 1024; // 1 MiB
+// 1 MiB bounds how much we buffer while waiting for a complete event.
+export const MAX_SSE_BUFFER_BYTES = 1024 * 1024;
+
+// Shared by both SSE consumers: raw pass-through validation (server) and event
+// parsing (here). `wrapError` lets the server raise its 502 upstream_error.
+export function assertSseBufferLimit(buffer, wrapError) {
+  if (buffer.length > MAX_SSE_BUFFER_BYTES) {
+    const err = new Error(`SSE buffer exceeded ${MAX_SSE_BUFFER_BYTES} bytes without a complete event — upstream may not be sending blank lines.`);
+    throw wrapError ? wrapError(err) : err;
+  }
+}
 
 export async function* parseResponsesSSE(stream) {
   let buffer = '';
   for await (const chunk of readChunks(stream)) {
     buffer += chunk;
-    if (buffer.length > MAX_SSE_BUFFER_BYTES) {
-      throw new Error(`SSE buffer exceeded ${MAX_SSE_BUFFER_BYTES} bytes without a complete event — upstream may not be sending blank lines.`);
-    }
+    assertSseBufferLimit(buffer);
     for (;;) {
       const separator = buffer.match(/\r\n\r\n|\r\r|\n\n/);
       if (!separator) break;

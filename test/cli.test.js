@@ -2,12 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
-import { healthy, openBrowser, persistLogin } from '../src/cli.js';
+import { healthy, openBrowser, persistLogin, promptLine, waitForCallback } from '../src/cli.js';
 import { getValidToken, loadAuth, saveAuth } from '../src/token-store.js';
 import { VERSION } from '../src/upstream.js';
 
@@ -469,14 +470,12 @@ test('server shutdown preserves a replacement PID record', async () => {
 test('a malformed --port fails immediately and names the real cause', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-bad-port-'));
   try {
-    for (const args of [['serve', '--port', 'abc'], ['serve', '--port=abc'], ['ensure-running', '--port', '70000'], ['serve', '--port', '-1'], ['serve', '--port', '1.5'], ['serve', '--port']]) {
+    for (const args of [['serve', '--port', 'abc'], ['serve', '--port=abc'], ['ensure-running', '--port', '70000'], ['serve', '--port', '-1'], ['serve', '--port', '1.5'], ['serve', '--port'], ['serve', '--port', '0']]) {
       const result = runCli(tmpDir, args);
       assert.notEqual(result.status, 0, `${args.join(' ')} was accepted`);
       assert.match(result.stderr, /Invalid --port value/);
       assert.doesNotMatch(result.stderr + result.stdout, /did not become healthy/);
     }
-    const ok = runCli(tmpDir, ['serve', '--port', '0', '--help']);
-    assert.equal(ok.status, 0, ok.stderr);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -655,6 +654,21 @@ test('SessionStart hook recognizes a healthy bridge and does not respawn it', as
   }
 });
 
+test('SessionStart hook rejects a malformed KGB_PORT without spawning serve', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-hook-badport-'));
+  try {
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL('../hooks/ensure-running.mjs', import.meta.url))], {
+      env: isolatedEnv(tmpDir, { KIMI_PLUGIN_ROOT: tmpDir, KGB_PORT: 'abc' }),
+      encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, 'hook must never block session startup');
+    assert.match(result.stderr, /invalid KGB_PORT/);
+    assert.equal(fs.existsSync(path.join(tmpDir, 'kgb')), false, 'hook spawned state despite the invalid port');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('teardown warnings reuse TOML parsing for indentation and single quotes', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-teardown-refs-'));
   const kimiHome = path.join(tmpDir, 'kimi');
@@ -673,6 +687,273 @@ test('teardown warnings reuse TOML parsing for indentation and single quotes', (
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /WARNING/);
     assert.match(result.stdout, /default_model = "chatgpt\/retired-model"/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('promptLine rejects on stdin EOF instead of hanging', async () => {
+  const stdin = new EventEmitter();
+  stdin.resume = () => {};
+  stdin.pause = () => {};
+  stdin.setEncoding = () => {};
+  const pending = promptLine('Paste the redirect URL or code here: ', stdin);
+  stdin.emit('end');
+  await assert.rejects(pending, /stdin closed before input was received/);
+});
+
+test('promptLine resolves the first line and stops listening', async () => {
+  const stdin = new EventEmitter();
+  stdin.resume = () => {};
+  stdin.pause = () => {};
+  stdin.setEncoding = () => {};
+  const pending = promptLine('Paste the redirect URL or code here: ', stdin);
+  stdin.emit('data', 'abc123\nignored');
+  assert.equal(await pending, 'abc123');
+  assert.equal(stdin.listenerCount('data'), 0);
+  assert.equal(stdin.listenerCount('end'), 0);
+});
+
+test('waitForCallback force-closes keep-alive connections on timeout', async () => {
+  // A preconnected browser socket must not keep the process alive after the wait fails.
+  const waiting = waitForCallback('state-timeout-test', 500);
+  const socket = await new Promise((resolve, reject) => {
+    const sock = net.createConnection(1455, '127.0.0.1', () => resolve(sock));
+    sock.once('error', reject);
+  });
+  const closed = new Promise((resolve) => socket.once('close', resolve));
+  await assert.rejects(waiting, /Timed out waiting for the login callback/);
+  await closed;
+  assert.equal(socket.destroyed, true);
+});
+
+test('setup honors --port in the generated provider config', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-setup-port-'));
+  try {
+    const result = runCli(tmpDir, ['setup', '--port', '5999']);
+    assert.equal(result.status, 0, result.stderr);
+    const config = fs.readFileSync(path.join(tmpDir, 'kimi', 'config.toml'), 'utf8');
+    assert.match(config, /base_url = "http:\/\/127\.0\.0\.1:5999\/v1"/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('KGB_PORT=0 is rejected like any other invalid port', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-zero-port-'));
+  try {
+    const result = runCli(tmpDir, ['ensure-running'], { KGB_PORT: '0' });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Invalid KGB_PORT value/);
+    assert.doesNotMatch(result.stderr + result.stdout, /did not become healthy/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('SIGHUP shuts the server down and removes its PID record', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-sighup-'));
+  const blocker = http.createServer();
+  let pid;
+  try {
+    await listen(blocker);
+    const port = blocker.address().port;
+    await closeServer(blocker);
+    const started = await runCliAsync(tmpDir, ['ensure-running', '--port', String(port)]);
+    assert.equal(started.status, 0, started.stderr);
+    const pidFile = path.join(tmpDir, 'kgb', `server-${port}.pid`);
+    const record = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
+    pid = record.pid;
+    process.kill(pid, 'SIGHUP');
+    assert.equal(await waitForProcessExit(pid), true, 'server did not exit on SIGHUP');
+    assert.equal(fs.existsSync(pidFile), false, 'PID record was not removed');
+  } finally {
+    if (pid && processIsAlive(pid)) process.kill(pid, 'SIGTERM');
+    if (blocker.listening) await closeServer(blocker);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('an unwritable server.log does not crash the server', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-badlog-'));
+  const blocker = http.createServer();
+  let stderr = '';
+  let exited = false;
+  try {
+    await listen(blocker);
+    const port = blocker.address().port;
+    await closeServer(blocker);
+    // A directory at the log path makes createWriteStream fail asynchronously.
+    fs.mkdirSync(path.join(tmpDir, 'kgb', 'server.log'), { recursive: true });
+    const child = spawn(process.execPath, [CLI_PATH, 'serve', '--port', String(port)], {
+      env: isolatedEnv(tmpDir),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('exit', () => { exited = true; });
+    try {
+      let up = false;
+      const deadline = Date.now() + 8000;
+      while (!up && Date.now() < deadline && !exited) {
+        up = Boolean(await healthy(port));
+        if (!up) await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      assert.equal(up, true, `server never became healthy; stderr: ${stderr}`);
+      assert.equal(exited, false, 'server exited after the log stream failed');
+      assert.match(stderr, /log write failed|EISDIR/);
+    } finally {
+      if (!exited) child.kill('SIGTERM');
+      await new Promise((resolve) => child.once('exit', resolve));
+    }
+  } finally {
+    if (blocker.listening) await closeServer(blocker);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('a hung python3 makes setup fail with a named timeout instead of blocking', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-pyhang-'));
+  const binDir = path.join(tmpDir, 'bin');
+  try {
+    fs.mkdirSync(binDir, { recursive: true });
+    // The reference scanner contains "json.dump"; let the real python run it
+    // and hang only the validation call so the refusal is exercised.
+    fs.writeFileSync(path.join(binDir, 'python3'), [
+      '#!/bin/sh',
+      'case "$2" in',
+      '  *json.dump*) exec /usr/bin/python3 "$@" ;;',
+      '  *) sleep 60 ;;',
+      'esac',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const result = runCli(tmpDir, ['setup'], { PATH: `${binDir}:/usr/bin:/bin` });
+    assert.notEqual(result.status, 0, 'setup succeeded despite a hung validator');
+    assert.match(result.stderr + result.stdout, /killed by signal|Could not validate config\.toml/);
+    assert.equal(fs.existsSync(path.join(tmpDir, 'kimi', 'config.toml')), false);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+// With a request still in flight, server.close() never finishes; the 2s
+// fallback must close the log stream and exit anyway.
+test('SIGTERM forced-exit fallback fires while a request hangs upstream', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-forced-exit-'));
+  const blackhole = http.createServer(() => {});
+  let child;
+  let client;
+  try {
+    await listen(blackhole);
+    fs.mkdirSync(path.join(tmpDir, 'kgb'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'kgb', 'auth.json'), JSON.stringify({
+      access: 'test-access', refresh: 'test-refresh', expires: Date.now() + 3_600_000, accountId: 'acct',
+    }));
+    const blocker = http.createServer();
+    await listen(blocker);
+    const port = blocker.address().port;
+    await closeServer(blocker);
+    child = spawn(process.execPath, [CLI_PATH, 'serve', '--port', String(port)], {
+      env: isolatedEnv(tmpDir, { KGB_UPSTREAM_BASE: `http://127.0.0.1:${blackhole.address().port}` }),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const pidFile = path.join(tmpDir, 'kgb', `server-${port}.pid`);
+    const startDeadline = Date.now() + 8000;
+    while (!fs.existsSync(pidFile) && Date.now() < startDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(fs.existsSync(pidFile), 'server did not write its PID record');
+
+    const body = JSON.stringify({ model: 'gpt-5.4', messages: [{ role: 'user', content: 'hi' }], stream: true });
+    client = net.createConnection(port, '127.0.0.1', () => {
+      client.write(
+        `POST /v1/chat/completions HTTP/1.1\r\n` +
+        `host: 127.0.0.1:${port}\r\n` +
+        `authorization: Bearer kimi-gpt-bridge\r\n` +
+        `content-type: application/json\r\n` +
+        `content-length: ${Buffer.byteLength(body)}\r\n\r\n` +
+        body,
+      );
+    });
+    // Let the request reach the hung upstream before signalling.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    child.kill('SIGTERM');
+    const code = await Promise.race([
+      new Promise((resolve) => child.once('exit', resolve)),
+      new Promise((resolve) => setTimeout(() => resolve('timeout'), 8000)),
+    ]);
+    assert.equal(code, 0, 'serve did not exit 0 via the forced-shutdown fallback');
+  } finally {
+    client?.destroy();
+    if (child && child.exitCode === null) child.kill('SIGKILL');
+    await closeServer(blackhole);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('models sync preserves the configured port; --port rewrites it', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-sync-port-'));
+  const catalog = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      models: [{ slug: 'gpt-sync-port', visibility: 'list', supported_in_api: true, priority: 1 }],
+    }));
+  });
+  try {
+    const setup = runCli(tmpDir, ['setup', '--port', '5999'], { KGB_PORT: '' });
+    assert.equal(setup.status, 0, setup.stderr);
+    const configFile = path.join(tmpDir, 'kimi', 'config.toml');
+    assert.match(fs.readFileSync(configFile, 'utf8'), /127\.0\.0\.1:5999/);
+
+    // Credentials plus a local catalog endpoint keep the sync fully offline;
+    // KGB_CLIENT_VERSION pins the catalog version so no registry is contacted.
+    await listen(catalog);
+    fs.mkdirSync(path.join(tmpDir, 'kgb'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'kgb', 'auth.json'), JSON.stringify({
+      access: 'offline-access', refresh: 'offline-refresh',
+      expires: Date.now() + 3_600_000, accountId: 'acct',
+    }));
+    const env = {
+      KGB_UPSTREAM_BASE: `http://127.0.0.1:${catalog.address().port}`,
+      KGB_CLIENT_VERSION: '0.153.0',
+      KGB_PORT: '',
+    };
+    const sync = await runCliAsync(tmpDir, ['models', 'sync'], env);
+    assert.equal(sync.status, 0, sync.stderr);
+    let config = fs.readFileSync(configFile, 'utf8');
+    assert.match(config, /127\.0\.0\.1:5999/, 'sync rewrote the custom port back to the default');
+    assert.match(config, /gpt-sync-port/);
+
+    const rewritten = await runCliAsync(tmpDir, ['models', 'sync', '--port', '7000'], env);
+    assert.equal(rewritten.status, 0, rewritten.stderr);
+    config = fs.readFileSync(configFile, 'utf8');
+    assert.match(config, /127\.0\.0\.1:7000/);
+    assert.doesNotMatch(config, /127\.0\.0\.1:5999/);
+  } finally {
+    await closeServer(catalog);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('an explicitly set KGB_PORT wins over the port already in config.toml', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-env-port-'));
+  const configFile = path.join(tmpDir, 'kimi', 'config.toml');
+  try {
+    const first = runCli(tmpDir, ['setup'], { KGB_PORT: '5999' });
+    assert.equal(first.status, 0, first.stderr);
+    assert.match(fs.readFileSync(configFile, 'utf8'), /127\.0\.0\.1:5999/);
+
+    const second = runCli(tmpDir, ['setup'], { KGB_PORT: '7000' });
+    assert.equal(second.status, 0, second.stderr);
+    let config = fs.readFileSync(configFile, 'utf8');
+    assert.match(config, /127\.0\.0\.1:7000/);
+    assert.doesNotMatch(config, /127\.0\.0\.1:5999/);
+
+    // Without KGB_PORT the existing configured port is kept, not reset.
+    const third = runCli(tmpDir, ['setup'], { KGB_PORT: '' });
+    assert.equal(third.status, 0, third.stderr);
+    config = fs.readFileSync(configFile, 'utf8');
+    assert.match(config, /127\.0\.0\.1:7000/);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

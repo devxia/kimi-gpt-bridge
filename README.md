@@ -5,7 +5,7 @@ Use your **ChatGPT Plus/Pro subscription** inside [Kimi Code](https://github.com
 ## What you get
 
 - **ChatGPT subscription as the model provider**: OAuth login using the Codex flow; Kimi Code's main agent runs on GPT models through the local bridge
-- **Live model list with reasoning levels**: models available to your plan are synced from ChatGPT, including supported `low`/`medium`/`high`/`xhigh`/`max` efforts where advertised
+- **Live model list with reasoning levels**: models available to your plan are synced from ChatGPT, including supported `minimal`/`low`/`medium`/`high`/`xhigh`/`max` efforts where advertised
 - **Chat Completions and Responses compatibility**: `/v1/chat/completions`, `/v1/responses`, and `/v1/models` are available on loopback
 - **Tool-call continuity**: tool constraints are forwarded, and encrypted reasoning is carried into the immediately following tool-result turn
 - **Usage visibility**: `status` reports account details, token state, and best-effort subscription usage
@@ -56,7 +56,7 @@ From then on the bridge server starts automatically with every session.
 | Slash command | CLI equivalent | What it does |
 |---|---|---|
 | `/kimi-gpt-bridge:login` | `login [--device]` | ChatGPT OAuth login; `--device` uses the 15-minute headless flow |
-| `/kimi-gpt-bridge:setup` | `setup` | Write/update the provider and model entries after real TOML validation |
+| `/kimi-gpt-bridge:setup` | `setup [--port N]` | Write/update the provider and model entries after real TOML validation |
 | `/kimi-gpt-bridge:refresh` | `models sync` | Refresh models, refusing changes that would invalidate configured default-model references |
 | — | `models list` | Show the live model catalog without changing config |
 | `/kimi-gpt-bridge:status` | `status` | Login state and best-effort subscription usage |

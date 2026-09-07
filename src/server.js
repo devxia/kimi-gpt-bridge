@@ -9,10 +9,14 @@ import {
   createChatChunkStream,
   collectChatCompletion,
   readChunks,
+  sseData,
+  isAdjacentToolContinuation,
+  assertSseBufferLimit,
 } from './translate.js';
 import { callUpstream, upstreamError, VERSION } from './upstream.js';
 import { loadAuth, kgbHome } from './token-store.js';
 import { getModelIds } from './models.js';
+import { atomicWriteFile } from './util.js';
 
 const SERVICE = 'kimi-gpt-bridge';
 const MODEL_CREATED = 1750000000;
@@ -30,8 +34,8 @@ export function getPort() {
   const raw = process.env.KGB_PORT;
   if (raw === undefined || String(raw).trim() === '') return 1456;
   const value = Number(raw);
-  if (!Number.isInteger(value) || value < 0 || value > 65535) {
-    throw new Error(`Invalid KGB_PORT value: ${raw} — expected an integer between 0 and 65535.`);
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new Error(`Invalid KGB_PORT value: ${raw} — expected an integer between 1 and 65535.`);
   }
   return value;
 }
@@ -162,16 +166,6 @@ function reasoningTurnPrefix(messages) {
   return adjacentToolContinuation ? messages.slice(0, assistantIndex) : messages;
 }
 
-// Shared logic: check whether messages after assistantIndex are exactly the
-// tool outputs for the given callIds (same set membership, all tool-role).
-function isAdjacentToolContinuation(messages, assistantIndex, callIds) {
-  const continuation = messages.slice(assistantIndex + 1);
-  if (!continuation.length || continuation.some((m) => m?.role !== 'tool')) return false;
-  const expected = new Set(callIds);
-  const actual = new Set(continuation.map((m) => m.tool_call_id));
-  return expected.size === actual.size && [...expected].every((id) => actual.has(id));
-}
-
 function reasoningCacheKey(req, sessionId, messages) {
   const headerKey = requestHeader(req, 'x-kimi-session-id') ?? requestHeader(req, 'x-session-id');
   if (headerKey) return headerKey;
@@ -218,14 +212,6 @@ async function writeResponse(res, chunk) {
   if (!res.write(chunk)) await waitForDrain(res);
 }
 
-function sseData(rawEvent) {
-  const dataLines = [];
-  for (const line of rawEvent.split(/\r\n|\r|\n/)) {
-    if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
-  }
-  return dataLines.length ? dataLines.join('\n') : undefined;
-}
-
 function isTerminalResponseEvent(rawEvent) {
   const data = sseData(rawEvent);
   if (data == null || data === '[DONE]') return false;
@@ -242,6 +228,7 @@ async function* validateResponsesStream(stream) {
   let buffer = '';
   for await (const chunk of readChunks(stream)) {
     buffer += chunk;
+    assertSseBufferLimit(buffer, upstreamStreamError);
     for (;;) {
       const separator = buffer.match(/\r\n\r\n|\r\r|\n\n/);
       if (!separator) break;
@@ -415,9 +402,6 @@ export function createBridgeServer({
           port: address && typeof address === 'object' ? address.port : getPort(),
           authed: Boolean(auth),
         };
-        if (auth?.accountId) health.accountId = auth.accountId;
-        if (auth?.planType) health.planType = auth.planType;
-        if (auth?.email) health.email = auth.email;
         sendJson(res, 200, health);
         return;
       }
@@ -445,23 +429,6 @@ export function createBridgeServer({
   return server;
 }
 
-function atomicWriteFile(file, content, mode) {
-  const existingMode = fs.existsSync(file) ? fs.statSync(file).mode & 0o777 : undefined;
-  const targetMode = mode ?? existingMode ?? 0o600;
-  const tmp = path.join(
-    path.dirname(file),
-    `.${path.basename(file)}.tmp-${process.pid}-${crypto.randomUUID()}`,
-  );
-  try {
-    fs.writeFileSync(tmp, content, { mode: targetMode });
-    fs.chmodSync(tmp, targetMode);
-    fs.renameSync(tmp, file);
-  } catch (err) {
-    try { fs.rmSync(tmp); } catch { /* best effort */ }
-    throw err;
-  }
-}
-
 function removeOwnedPidRecord(pidFile, expected) {
   try {
     const current = JSON.parse(fs.readFileSync(pidFile, 'utf8'));
@@ -483,6 +450,8 @@ function removeOwnedPidRecord(pidFile, expected) {
 export async function startServer({ port = getPort(), sessionId, fetchImpl } = {}) {
   fs.mkdirSync(kgbHome(), { recursive: true, mode: 0o700 });
   const logStream = fs.createWriteStream(path.join(kgbHome(), 'server.log'), { flags: 'a' });
+  // Without a listener a stream error (ENOSPC, permissions) becomes an uncaught exception.
+  logStream.on('error', (err) => process.stderr.write(`kimi-gpt-bridge log write failed: ${err.message}\n`));
   const log = (line) => logStream.write(`[${new Date().toISOString()}] ${line}\n`);
   const server = createBridgeServer({ sessionId, fetchImpl, log });
 
@@ -501,7 +470,7 @@ export async function startServer({ port = getPort(), sessionId, fetchImpl } = {
     port: actualPort,
     startedAt: new Date().toISOString(),
   };
-  atomicWriteFile(pidFile, JSON.stringify(record, null, 2), 0o600);
+  atomicWriteFile(pidFile, JSON.stringify(record, null, 2), { mode: 0o600 });
   log(`listening on 127.0.0.1:${actualPort} (pid ${process.pid})`);
 
   // A listen-time error is already caught above; subsequent socket-layer errors

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   configPath,
   loadConfig,
-  saveConfig,
+  persistConfig,
   resolveProxy,
   describeProxy,
   redactProxyUrl,
@@ -48,7 +48,7 @@ function runCli(args) {
 }
 
 test('save/load roundtrip and file mode 0600', () => {
-  saveConfig({ proxy: 'http://127.0.0.1:PORT' });
+  persistConfig({ proxy: 'http://127.0.0.1:PORT' });
   assert.deepEqual(loadConfig(), { proxy: 'http://127.0.0.1:PORT' });
   assert.equal(fs.statSync(configPath()).mode & 0o777, 0o600);
 });
@@ -62,12 +62,12 @@ test('resolveProxy: null when nothing is set', () => {
 });
 
 test('resolveProxy: config value used when no env override', () => {
-  saveConfig({ proxy: 'http://127.0.0.1:PORT' });
+  persistConfig({ proxy: 'http://127.0.0.1:PORT' });
   assert.equal(resolveProxy(), 'http://127.0.0.1:PORT');
 });
 
 test('resolveProxy: KGB_PROXY env wins over config', () => {
-  saveConfig({ proxy: 'http://127.0.0.1:PORT' });
+  persistConfig({ proxy: 'http://127.0.0.1:PORT' });
   process.env.KGB_PROXY = 'http://127.0.0.1:1080';
   assert.equal(resolveProxy(), 'http://127.0.0.1:1080');
 });
@@ -78,7 +78,7 @@ test('resolveProxy: HTTPS_PROXY env is the fallback when nothing else is set', (
 });
 
 test('resolveProxy: persisted config wins over HTTPS_PROXY env', () => {
-  saveConfig({ proxy: 'http://127.0.0.1:PORT' });
+  persistConfig({ proxy: 'http://127.0.0.1:PORT' });
   process.env.HTTPS_PROXY = 'http://127.0.0.1:8080';
   assert.equal(resolveProxy(), 'http://127.0.0.1:PORT');
 });

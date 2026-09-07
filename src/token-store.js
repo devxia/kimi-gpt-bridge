@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { refreshTokens, extractAccountInfo } from './oauth.js';
+import { atomicWriteFile, pidIsAlive } from './util.js';
 
 const LOCK_WAIT_TIMEOUT_MS = 15_000;
 const LOCK_STALE_MS = 120_000;
@@ -51,15 +52,6 @@ function readLockOwnerAt(file) {
   }
 }
 
-function processIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code !== 'ESRCH';
-  }
-}
-
 function recoverLockFile(file) {
   const owner = readLockOwnerAt(file);
   if (owner === null) return true;
@@ -71,7 +63,7 @@ function recoverLockFile(file) {
     throw err;
   }
   const validPid = Number.isSafeInteger(owner.pid) && owner.pid > 0;
-  if (validPid && processIsAlive(owner.pid)) {
+  if (validPid && pidIsAlive(owner.pid)) {
     // Even when the PID is alive, reclaim locks older than the hard maximum age.
     // This bounds the worst-case leak from PID reuse: an unrelated long-lived
     // process inheriting the old lock PID cannot hold it forever.
@@ -295,18 +287,7 @@ export function loadAuth() {
 
 // Atomic write (tmp file + rename) with 0o600 permissions; home dir is 0o700.
 function writeAuthUnlocked(serialized) {
-  const file = authPath();
-  const tmp = `${file}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  fs.writeFileSync(tmp, serialized, { mode: 0o600 });
-  try {
-    fs.renameSync(tmp, file);
-  } catch (err) {
-    try { fs.rmSync(tmp); } catch (cleanupErr) {
-      if (cleanupErr.code !== 'ENOENT') err.cleanupError = cleanupErr;
-    }
-    throw err;
-  }
-  try { fs.chmodSync(file, 0o600); } catch { /* best effort */ }
+  atomicWriteFile(authPath(), serialized, { mode: 0o600 });
 }
 
 export function saveAuth(auth) {

@@ -545,3 +545,28 @@ test('resolveClientVersion falls back to the floor on registry errors and bad pa
   });
   assert.deepEqual(badPayload, { version: MODELS_CLIENT_VERSION, source: 'pinned' });
 });
+
+test('selectModels keeps the supported max effort while dropping ultra/off/none', () => {
+  const models = selectModels([
+    {
+      slug: 'gpt-max',
+      visibility: 'list',
+      supported_in_api: true,
+      priority: 1,
+      default_reasoning_level: 'max',
+      supported_reasoning_levels: [
+        { effort: 'low' },
+        { effort: 'max' },
+        { effort: 'ultra' },
+        { effort: 'off' },
+        { effort: 'none' },
+      ],
+    },
+  ], undefined);
+  assert.equal(models.length, 1);
+  assert.equal(models[0].defaultEffort, 'max');
+  assert.deepEqual(models[0].efforts, ['low', 'max']);
+  const block = buildConfigBlock(models, 1456);
+  assert.match(block, /default_effort = "max"/);
+  assert.match(block, /support_efforts = \[ "low", "max" \]/);
+});

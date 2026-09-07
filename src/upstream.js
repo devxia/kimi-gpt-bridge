@@ -52,10 +52,11 @@ export async function upstreamError(res) {
   const code = nested?.code ?? data?.code ?? null;
 
   const limitFields = [nested?.type, nested?.code, data?.type, data?.code];
-  if (res.status === 429 && limitFields.some((value) => USAGE_LIMIT_TYPES.has(value))) {
+  if (res.status === 429) {
     const planType = nested?.plan_type ?? data?.plan_type;
-    const plan = planType ? ` (plan: ${planType})` : '';
+    const plan = planType && limitFields.some((value) => USAGE_LIMIT_TYPES.has(value)) ? ` (plan: ${planType})` : '';
     const resetsAt = nested?.resets_at ?? data?.resets_at;
+    // Reset timing helps on any 429, not just recognized usage-limit codes.
     const reset = resetsAt != null ? ` — ${humanizeReset(resetsAt)}` : '';
     message = `${message}${plan}${reset}`;
   }

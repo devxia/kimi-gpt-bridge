@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { kgbHome } from './token-store.js';
+import { atomicWriteFile } from './util.js';
 
 export function configPath() {
   return path.join(kgbHome(), 'config.json');
@@ -19,21 +20,12 @@ export function loadConfig() {
   }
 }
 
-// Atomic write (tmp file + rename) with 0o600 permissions, same as token-store.
-export function saveConfig(config) {
+// Atomic write (tmp file + rename) with 0o600 permissions; home dir is 0o700.
+export function persistConfig(config) {
   const dir = kgbHome();
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(dir, 0o700); } catch { /* best effort */ }
-  const file = configPath();
-  const tmp = `${file}.tmp-${process.pid}`;
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, file);
-    try { fs.chmodSync(file, 0o600); } catch { /* best effort */ }
-  } catch (err) {
-    try { fs.rmSync(tmp); } catch { /* ignore cleanup failure */ }
-    throw err;
-  }
+  atomicWriteFile(configPath(), JSON.stringify(config, null, 2), { mode: 0o600 });
 }
 
 // Conventional shell proxy env vars, honored so users with a proxied shell
