@@ -352,7 +352,7 @@ with open(sys.argv[1], "rb") as file:
     config = tomllib.load(file)
 references = []
 def add(setting, model):
-    if isinstance(model, str) and model.startswith("chatgpt/"):
+    if isinstance(model, str) and model.startswith(("chatgpt/", "kimi-gpt-bridge/")):
         references.append({"setting": setting, "model": model})
 add("default_model", config.get("default_model"))
 secondary = config.get("secondary_model")
@@ -461,24 +461,35 @@ function writeKimiConfig(configFile, content) {
   atomicWriteFile(configFile, content, { validate: validateTomlFile });
 }
 
-function writeConfigBlock(models, explicitPort) {
+function preferredModelAlias(content, slug) {
+  const script = 'import sys, tomllib\nmodels = tomllib.loads(sys.stdin.read()).get("models", {})\nprint("kimi-gpt-bridge/" if "kimi-gpt-bridge/" + sys.argv[1] in models else "chatgpt/")';
+  const parsed = spawnSync('python3', ['-c', script, slug], { input: content, encoding: 'utf8', timeout: 10_000 });
+  if (parsed.error || parsed.signal) {
+    throw new Error(`Python tomllib alias inspection was killed by signal or timed out: ${parsed.error?.message ?? parsed.signal}. The original config.toml is unchanged.`);
+  }
+  if (parsed.status !== 0) throw new Error(`Could not inspect the proposed model alias in config.toml: ${parsed.stderr.trim().split('\n').at(-1)}. The original config.toml is unchanged.`);
+  return `${parsed.stdout.trim()}${slug}`;
+}
+
+function writeConfigBlock(models, explicitPort, suggestedSlug) {
   const configFile = kimiConfigPath();
   const existing = fs.existsSync(configFile) ? fs.readFileSync(configFile, 'utf8') : '';
   const port = resolveWritePort(explicitPort);
   const overrideBaseUrl = explicitPort != null || (process.env.KGB_PORT ?? '').trim() !== '';
   const candidate = mergeConfigModels(existing, models, port, { overrideBaseUrl });
   const replacing = existing !== '';
+  const suggestedAlias = suggestedSlug ? preferredModelAlias(candidate, suggestedSlug) : null;
   writeKimiConfig(configFile, candidate);
-  return { configFile, replacing };
+  return { configFile, replacing, suggestedAlias };
 }
 
 async function cmdSetup(flags = {}) {
   const models = await resolveModels();
-  const { configFile, replacing } = writeConfigBlock(models, flags.port);
+  const { configFile, replacing, suggestedAlias } = writeConfigBlock(models, flags.port, models[0].slug);
   console.log(`${replacing ? 'Updated' : 'Added'} the kimi-gpt-bridge provider in ${configFile}`);
   console.log('\nNext steps:');
   console.log('  1. Run `/reload` in Kimi Code.');
-  console.log(`  2. Switch model with \`/model\` → chatgpt/${models[0].slug}`);
+  console.log(`  2. Switch model with \`/model\` → ${suggestedAlias}`);
   console.log('  3. If the server is not running yet: `kimi-gpt-bridge ensure-running` (or restart Kimi Code).');
 }
 
@@ -703,7 +714,7 @@ async function cmdTeardown(flags) {
       const stale = readTomlModelReferences(configFile);
       if (stale.length) {
         console.log('\n*** WARNING ***');
-        console.log('These settings still reference chatgpt/... models that no longer exist:');
+        console.log('These settings still reference chatgpt/... or kimi-gpt-bridge/... models that no longer exist:');
         for (const reference of stale) console.log(`  - ${describeModelReference(reference)}`);
         console.log('Kimi Code fails startup validation on unresolved model references.');
         console.log('Edit config.toml or use `/model` (and `/secondary-model`) to pick other models.');

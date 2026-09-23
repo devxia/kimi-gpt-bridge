@@ -46,7 +46,7 @@ Browser OAuth waits up to 10 minutes. Device-code login waits up to 15 minutes.
 1. /plugins install https://github.com/devxia/kimi-gpt-bridge
 2. /kimi-gpt-bridge:login      # a browser opens for ChatGPT sign-in
 3. /kimi-gpt-bridge:setup      # validates and atomically updates config.toml
-4. /reload, then /model → chatgpt/gpt-5.6-terra
+4. /reload, then /model → kimi-gpt-bridge/gpt-5.6-terra
 ```
 
 From then on the bridge server starts automatically with every session.
@@ -57,7 +57,7 @@ When ChatGPT releases a new model or retires an old one, run these commands **on
 
 1. `/kimi-gpt-bridge:refresh` — wait for the model refresh to finish.
 2. `/reload` — reload the updated configuration.
-3. `/model` — choose an available `chatgpt/...` model.
+3. `/model` — choose an available `kimi-gpt-bridge/...` model (or a preserved `chatgpt/...` alias).
 
 You do not need to uninstall the plugin or repeat setup. If refresh reports that you are not logged in, run `/kimi-gpt-bridge:login`, then retry refresh.
 
@@ -67,7 +67,7 @@ If an old model is no longer available:
 
 - Switch to an available model with `/model`.
 - If refresh reports that a retired model is still referenced, replace the references it lists in your main/secondary model settings, then run refresh and `/reload` again. A refused refresh leaves your config unchanged.
-- Models explicitly retired by the plugin are removed when no longer referenced. A model merely missing from ChatGPT's latest list stays in your config to preserve its settings. If you no longer want that entry, remove its `[models."chatgpt/<old-model>"]` configuration and any references from `config.toml`, then run `/reload`.
+- Models explicitly retired by the plugin are removed when no longer referenced. A model merely missing from ChatGPT's latest list stays in your config to preserve its settings. If you no longer want that entry, remove its `[models."kimi-gpt-bridge/<old-model>"]` or legacy `[models."chatgpt/<old-model>"]` configuration and any references from `config.toml`, then run `/reload`.
 
 If a new model still does not appear, inspect the models currently offered to your account without changing your config:
 
@@ -106,7 +106,7 @@ The live catalog still follows your account's plan and upstream visibility, rath
 | GPT-5.6-Terra / GPT-5.6-Luna (Older) | `medium` | `low`, `medium`, `high`, `xhigh`, `max` |
 | GPT-5.5 (Legacy) | `medium` | `low`, `medium`, `high`, `xhigh` |
 
-These fallback models use a **272000-token** context window. New live entries use `context_window`, not `max_context_window`; existing user-configured windows are preserved. GPT-5.5 gets the display name `GPT-5.5 (Legacy)` when its name is missing or still `GPT-5.5`. Custom display names and its `chatgpt/gpt-5.5` alias remain unchanged.
+These fallback models use a **272000-token** context window. New live entries use `context_window`, not `max_context_window`; existing user-configured windows are preserved. GPT-5.5 gets the display name `GPT-5.5 (Legacy)` when its name is missing or still `GPT-5.5`. Custom display names are preserved. An existing `chatgpt/gpt-5.5` alias is filled in place; new entries use `kimi-gpt-bridge/gpt-5.5`.
 
 GPT-5.4-Mini is retired: it is excluded from live, fallback, and cached lists. Both generation endpoints return HTTP 400 (`model_retired`) for `gpt-5.4-mini`, including the supported Chat effort suffixes. Other unknown model IDs continue to pass through. A usable cached list is only filtered, never padded with newly added models; if nothing remains, the bridge tries the live catalog and then the offline fallback.
 
@@ -118,7 +118,7 @@ Editing this checkout does **not** update the installed managed plugin. Update t
 
 ## Configuration safety
 
-`setup` and `models sync` merge additions into the existing configuration. They add new models and fill missing fields while preserving existing model/provider values, extra fields, nested settings, and comments. They do not replace the whole bridge block. For example, an existing Astra `default_effort = "high"` stays `high` after refresh. Existing models absent from the latest catalog are retained unless explicitly retired.
+`setup` and `models sync` merge additions into the existing configuration. Fresh entries use `kimi-gpt-bridge/<slug>`; an existing `chatgpt/<slug>` is filled in place rather than duplicated. If both aliases already exist, the old one is removed only when it exactly matches plugin-generated defaults, has no custom comments, and has no main/secondary reference; otherwise both stay. Existing model/provider values, extra fields, nested settings, and comments are preserved. For example, an existing Astra `default_effort = "high"` stays `high` after refresh. Existing models absent from the latest catalog are retained unless explicitly retired.
 
 The provider's existing URL and custom settings are preserved. An explicit `--port` or nonempty `KGB_PORT` overrides the provider URL; `--port` takes precedence. Missing fields use generated defaults, including `api_key = "kimi-gpt-bridge"` for a new provider.
 

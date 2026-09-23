@@ -277,7 +277,7 @@ test('setup and live sync retire mini safely while retaining Legacy references',
         assert.equal(fs.readFileSync(configFile, 'utf8'), original);
       }
       for (const reference of ['', 'default_model = "chatgpt/gpt-5.5"\n[secondary_model]\ndefault_model = "chatgpt/gpt-5.5"\n[secondary_model.models]\n"chatgpt/gpt-5.5" = 1\n']) {
-        fs.writeFileSync(configFile, reference + oldTables);
+        fs.writeFileSync(configFile, reference + oldTables + (reference ? '\n[models."chatgpt/gpt-5.5"]\nmodel = "gpt-5.5"\n' : ''));
         const result = await runCliAsync(tmpDir, command, env);
         assert.equal(result.status, 0, result.stderr);
         const text = fs.readFileSync(configFile, 'utf8');
@@ -285,11 +285,13 @@ test('setup and live sync retire mini safely while retaining Legacy references',
         const parsed = spawnSync('python3', ['-c', 'import json, sys, tomllib; json.dump(tomllib.loads(sys.stdin.read()), sys.stdout)'], { input: text, encoding: 'utf8' });
         assert.equal(parsed.status, 0, parsed.stderr);
         const config = JSON.parse(parsed.stdout);
-        assert.equal(config.models['chatgpt/gpt-5.5'].model, 'gpt-5.5');
-        assert.equal(config.models['chatgpt/gpt-5.5'].display_name, 'GPT-5.5 (Legacy)');
-        assert.equal(config.models['chatgpt/gpt-6-astra'].default_effort, 'medium');
-        assert.ok(config.models['chatgpt/gpt-6-sol']);
-        assert.ok(config.models['chatgpt/gpt-6-luna']);
+        const legacyAlias = reference ? 'chatgpt/gpt-5.5' : 'kimi-gpt-bridge/gpt-5.5';
+        assert.equal(config.models[legacyAlias].model, 'gpt-5.5');
+        assert.equal(config.models[legacyAlias].display_name, 'GPT-5.5 (Legacy)');
+        assert.equal(config.models[reference ? 'kimi-gpt-bridge/gpt-5.5' : 'chatgpt/gpt-5.5'], undefined);
+        assert.equal(config.models['kimi-gpt-bridge/gpt-6-astra'].default_effort, 'medium');
+        assert.ok(config.models['kimi-gpt-bridge/gpt-6-sol']);
+        assert.ok(config.models['kimi-gpt-bridge/gpt-6-luna']);
         if (reference) {
           assert.equal(config.default_model, 'chatgpt/gpt-5.5');
           assert.equal(config.secondary_model.default_model, 'chatgpt/gpt-5.5');
@@ -736,6 +738,7 @@ test('teardown warnings reuse TOML parsing for indentation and single quotes', (
   const configFile = path.join(kimiHome, 'config.toml');
   const config = [
     "   default_model = 'chatgpt/retired-model'",
+    "secondary_model = { default_model = 'kimi-gpt-bridge/retired-model', models = { 'kimi-gpt-bridge/retired-model' = 0 } }",
     '',
     "[ providers . 'kimi-gpt-bridge' ]",
     'type = "openai"',
@@ -748,6 +751,8 @@ test('teardown warnings reuse TOML parsing for indentation and single quotes', (
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /WARNING/);
     assert.match(result.stdout, /default_model = "chatgpt\/retired-model"/);
+    assert.match(result.stdout, /default_model = "kimi-gpt-bridge\/retired-model"/);
+    assert.match(result.stdout, /\[secondary_model.models\] entry "kimi-gpt-bridge\/retired-model"/);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -795,6 +800,22 @@ test('setup honors --port in the generated provider config', () => {
     assert.equal(result.status, 0, result.stderr);
     const config = fs.readFileSync(path.join(tmpDir, 'kimi', 'config.toml'), 'utf8');
     assert.match(config, /base_url = "http:\/\/127\.0\.0\.1:5999\/v1"/);
+    assert.match(result.stdout, /\/model.*kimi-gpt-bridge\/gpt-6-sol/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('setup prints a preserved legacy alias when it is the only alias for the first model', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-legacy-prompt-'));
+  try {
+    const file = path.join(tmpDir, 'kimi', 'config.toml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `[models.'chatgpt/gpt-6-sol']\nmodel = 'gpt-6-sol'\n`);
+    const result = runCli(tmpDir, ['setup']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /\/model.*chatgpt\/gpt-6-sol/);
+    assert.equal(parseConfig(fs.readFileSync(file, 'utf8')).models['kimi-gpt-bridge/gpt-6-sol'], undefined);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -1102,8 +1123,8 @@ keep = true
       for (const comment of ['# user preamble', '# provider note', '# Astra note', '# Legacy note']) assert.ok(text.includes(comment));
       assert.ok(text.includes("note = '''keep this\n[models.fake]\n'''"));
       if (command[0] === 'models') {
-        assert.equal(after.models['chatgpt/gpt-6-sol'], undefined, 'live sync must not pad with fallback models');
-        assert.equal(after.models['chatgpt/gpt-live-new'].max_context_size, 272000);
+        assert.equal(after.models['kimi-gpt-bridge/gpt-6-sol'], undefined, 'live sync must not pad with fallback models');
+        assert.equal(after.models['kimi-gpt-bridge/gpt-live-new'].max_context_size, 272000);
       }
       const repeat = await runCliAsync(tmpDir, command, env);
       assert.equal(repeat.status, 0, repeat.stderr);

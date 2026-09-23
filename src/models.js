@@ -267,7 +267,7 @@ export function tomlBasicString(value) {
 }
 
 // Full marker block for Kimi Code's config.toml: the provider table plus one
-// [models."chatgpt/<slug>"] entry per model.
+// [models."kimi-gpt-bridge/<slug>"] entry per model.
 export function buildConfigBlock(models, port) {
   const lines = [
     MARKER_START,
@@ -282,7 +282,7 @@ export function buildConfigBlock(models, port) {
     if (!nonEmptyString(m?.slug)) throw new TypeError('Model slugs must be non-empty strings.');
     if (seenSlugs.has(m.slug)) continue;
     seenSlugs.add(m.slug);
-    lines.push(`[models.${tomlBasicString(`chatgpt/${m.slug}`)}]`);
+    lines.push(`[models.${tomlBasicString(`kimi-gpt-bridge/${m.slug}`)}]`);
     lines.push('provider = "kimi-gpt-bridge"');
     lines.push(`model = ${tomlBasicString(m.slug)}`);
     lines.push(`display_name = ${tomlBasicString(nonEmptyString(m.displayName) ? m.displayName : m.slug)}`);
@@ -378,7 +378,7 @@ function parseTomlTableHeader(line) {
 function isBridgeTable(pathParts) {
   return (
     (pathParts[0] === 'providers' && pathParts[1] === 'kimi-gpt-bridge') ||
-    (pathParts[0] === 'models' && pathParts[1]?.startsWith('chatgpt/'))
+    (pathParts[0] === 'models' && (pathParts[1]?.startsWith('chatgpt/') || pathParts[1]?.startsWith('kimi-gpt-bridge/')))
   );
 }
 

@@ -54,7 +54,7 @@ keep = 'verbatim'
   assert.deepEqual(after.secondary_model, before.secondary_model);
   assert.equal(after.default_model, before.default_model);
   assert.deepEqual(after.unrelated, before.unrelated);
-  assert.equal(after.models['chatgpt/gpt-6-sol'].max_context_size, 272000);
+  assert.equal(after.models['kimi-gpt-bridge/gpt-6-sol'].max_context_size, 272000);
 });
 
 test('Astra fills only missing defaults and respects even empty or false existing values', () => {
@@ -76,17 +76,19 @@ test('Astra fills only missing defaults and respects even empty or false existin
     assert.equal(model.model, 'gpt-6-astra');
   }
   const inconsistentCatalog = { ...astra, efforts: ['high'] };
-  assert.equal(parse(merge('', [inconsistentCatalog])).models['chatgpt/gpt-6-astra'].default_effort, 'high');
+  assert.equal(parse(merge('', [inconsistentCatalog])).models['kimi-gpt-bridge/gpt-6-astra'].default_effort, 'high');
 });
 
 test('Legacy display name migrates only absent or stock names, even outside the catalog', () => {
   for (const models of [[legacy], [astra]]) {
-    for (const [name, expected] of [[null, 'GPT-5.5 (Legacy)'], ['GPT-5.5', 'GPT-5.5 (Legacy)'], ['Custom', 'Custom'], ['', '']]) {
-      const original = `[models.'chatgpt/gpt-5.5']\nmodel = 'gpt-5.5'\n${name === null ? '' : `display_name = '${name}' # keep comment\n`}`;
-      const result = merge(original, models);
-      assert.equal(parse(result).models['chatgpt/gpt-5.5'].display_name, expected);
-      assert.ok(result.includes("model = 'gpt-5.5'"));
-      if (name !== null) assert.ok(result.includes('# keep comment'));
+    for (const alias of ['chatgpt/gpt-5.5', 'kimi-gpt-bridge/gpt-5.5']) {
+      for (const [name, expected] of [[null, 'GPT-5.5 (Legacy)'], ['GPT-5.5', 'GPT-5.5 (Legacy)'], ['Custom', 'Custom'], ['', '']]) {
+        const original = `[models.'${alias}']\nmodel = 'gpt-5.5'\n${name === null ? '' : `display_name = '${name}' # keep comment\n`}`;
+        const result = merge(original, models);
+        assert.equal(parse(result).models[alias].display_name, expected);
+        assert.ok(result.includes("model = 'gpt-5.5'"));
+        if (name !== null) assert.ok(result.includes('# keep comment'));
+      }
     }
   }
 });
@@ -118,12 +120,13 @@ test('common TOML representations support missing fields, inline edits, nested a
     const before = parse(text);
     const result = merge(text, [astra, legacy]);
     const after = parse(result);
-    assert.equal(after.models['chatgpt/gpt-6-astra'].default_effort, before.models?.['chatgpt/gpt-6-astra']?.support_efforts ? 'high' : 'medium');
+    const alias = before.models?.['chatgpt/gpt-6-astra'] ? 'chatgpt/gpt-6-astra' : 'kimi-gpt-bridge/gpt-6-astra';
+    assert.equal(after.models[alias].default_effort, before.models?.['chatgpt/gpt-6-astra']?.support_efforts ? 'high' : 'medium');
     for (const [key, value] of Object.entries(before.models?.['chatgpt/gpt-6-astra'] ?? {})) {
-      assert.deepEqual(after.models['chatgpt/gpt-6-astra'][key], value);
+      assert.deepEqual(after.models[alias][key], value);
     }
     if (text.includes('# keep')) assert.ok(result.includes('# keep'));
-    assert.equal(after.models['chatgpt/gpt-5.5'].display_name, 'GPT-5.5 (Legacy)');
+    assert.equal(after.models['kimi-gpt-bridge/gpt-5.5'].display_name, 'GPT-5.5 (Legacy)');
   }
 });
 
@@ -186,7 +189,58 @@ test('incremental insertion safely escapes catalog aliases and display names', (
   const text = 'theme = "dark" # unchanged\n';
   const result = merge(text, [{ ...astra, slug, displayName }]);
   assert.ok(result.startsWith(text));
-  const model = parse(result).models[`chatgpt/${slug}`];
+  const model = parse(result).models[`kimi-gpt-bridge/${slug}`];
   assert.equal(model.model, slug);
   assert.equal(model.display_name, displayName);
+});
+
+test('slug matching fills an existing chatgpt alias without creating a second alias', () => {
+  const text = `[models.'chatgpt/gpt-6-astra']\nprovider = 'kimi-gpt-bridge'\nmodel = 'gpt-6-astra'\ndisplay_name = 'Personal Astra' # keep\n`;
+  const result = merge(text, [astra]);
+  assert.equal(parse(result).models['chatgpt/gpt-6-astra'].default_effort, 'medium');
+  assert.equal(parse(result).models['chatgpt/gpt-6-astra'].display_name, 'Personal Astra');
+  assert.ok(result.includes("display_name = 'Personal Astra' # keep"));
+  assert.equal(parse(result).models['kimi-gpt-bridge/gpt-6-astra'], undefined);
+});
+
+test('dual aliases prune only an unreferenced, uncustomized generated chatgpt entry', () => {
+  const generated = parse(merge('', [astra])).models['kimi-gpt-bridge/gpt-6-astra'];
+  const fields = Object.entries(generated).map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join('\n');
+  const newEntry = `[models.'kimi-gpt-bridge/gpt-6-astra']\nmodel = 'gpt-6-astra'\n`;
+  const oldEntry = `[models.'chatgpt/gpt-6-astra']\n${fields}\n`;
+  const pruned = parse(merge(oldEntry + newEntry, [astra]));
+  assert.equal(pruned.models['chatgpt/gpt-6-astra'], undefined);
+  assert.equal(pruned.models['kimi-gpt-bridge/gpt-6-astra'].model, 'gpt-6-astra');
+  for (const reference of [
+    `default_model = 'chatgpt/gpt-6-astra'\n`,
+    `secondary_model = { default_model = 'chatgpt/gpt-6-astra', models = { 'chatgpt/gpt-6-astra' = 0 } }\n`,
+  ]) {
+    const result = parse(merge(reference + oldEntry + newEntry, [astra]));
+    assert.ok(result.models['chatgpt/gpt-6-astra']);
+  }
+  for (const changed of [
+    { display_name: 'Custom' }, { extra: false }, { provider: 'other' },
+  ]) {
+    const customFields = Object.entries({ ...generated, ...changed }).map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join('\n');
+    const custom = `[models.'chatgpt/gpt-6-astra']\n${customFields}\n`;
+    assert.ok(parse(merge(custom + newEntry, [astra])).models['chatgpt/gpt-6-astra']);
+  }
+  for (const custom of [oldEntry.replace('provider =', '# user note\nprovider ='),
+    oldEntry.replace("[models.'chatgpt/gpt-6-astra']", "[models.'chatgpt/gpt-6-astra'] # user note")]) {
+    const result = merge(custom + newEntry, [astra]);
+    assert.ok(parse(result).models['chatgpt/gpt-6-astra']);
+    assert.ok(result.includes('# user note'));
+  }
+});
+
+test('both alias prefixes retire and validate references without touching the original on refusal', () => {
+  for (const prefix of ['chatgpt/', 'kimi-gpt-bridge/']) {
+    const alias = `${prefix}gpt-5.4-mini`;
+    const text = `[models.'${alias}']\nprovider = 'kimi-gpt-bridge'\nmodel = 'gpt-5.4-mini'\n`;
+    assert.equal(parse(merge(text, [astra])).models[alias], undefined);
+    for (const setting of [`default_model = '${alias}'\n`, `secondary_model = { models = { '${alias}' = 0 } }\n`]) {
+      assert.throws(() => merge(setting + text, [astra]), /missing or retired.*final merged configuration/s);
+    }
+    assert.throws(() => merge(`default_model = '${prefix}missing'\n`, [astra]), /missing or retired/);
+  }
 });

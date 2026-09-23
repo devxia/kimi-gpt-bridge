@@ -20,7 +20,7 @@ Uninstall the bridge:
 
    If that path does not exist, locate the kimi-gpt-bridge repo checkout and run `src/cli.js teardown` from there.
 
-3. This checks each port-scoped PID record and stops only processes whose port and PID match the bridge's verified health identity, then atomically removes bridge-owned provider/model tables from `config.toml`. If it warns that `default_model` or `secondary_model` settings still point to `chatgpt/...` models, relay those warnings prominently and suggest choosing new models with `/model` (and `/secondary-model`)—unresolved references make Kimi Code fail startup validation.
+3. This checks each port-scoped PID record and stops only processes whose port and PID match the bridge's verified health identity, then atomically removes bridge-owned provider/model tables under both `chatgpt/...` and `kimi-gpt-bridge/...` from `config.toml`. If it warns that `default_model` or `secondary_model` settings still point to either alias, relay those warnings prominently and suggest choosing new models with `/model` (and `/secondary-model`)—unresolved references make Kimi Code fail startup validation.
 
 4. Then instruct the user to run `/plugins remove kimi-gpt-bridge` in Kimi Code, followed by `/reload`.
 
