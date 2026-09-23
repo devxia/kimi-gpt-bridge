@@ -221,16 +221,39 @@ function removeTable(text, path) {
   return text;
 }
 
-function checkReferences(config, removed) {
+const bridgeSlug = (alias) => ['chatgpt/', 'kimi-gpt-bridge/'].find((prefix) => alias.startsWith(prefix));
+
+function modelReferences(config) {
   const references = [['default_model', config.default_model], ['secondary_model.default_model', config.secondary_model?.default_model]];
   if (table(config.secondary_model?.models)) {
     references.push(...Object.keys(config.secondary_model.models).map((alias) => ['secondary_model.models', alias]));
   }
-  const invalid = references.filter(([, alias]) => typeof alias === 'string' &&
-    (removed.has(alias) || (alias.startsWith('chatgpt/') && (!Object.hasOwn(config.models ?? {}, alias) || isRetiredModel(alias.slice(8))))));
+  return references.filter(([, alias]) => typeof alias === 'string');
+}
+
+function checkReferences(config, removed) {
+  const invalid = modelReferences(config).filter(([, alias]) => {
+    const prefix = bridgeSlug(alias);
+    return removed.has(alias) || (prefix && (!Object.hasOwn(config.models ?? {}, alias) || isRetiredModel(alias.slice(prefix.length))));
+  });
   if (invalid.length) {
     throw new Error(`Refusing to update config.toml because these settings reference missing or retired models in the final merged configuration:\n${invalid.map(([setting, alias]) => `  - ${setting} = ${JSON.stringify(alias)}`).join('\n')}\nThe original config.toml is unchanged. Choose available models and retry.`);
   }
+}
+
+function isStockLegacyAlias(model, generated) {
+  return table(model) && Object.keys(model).length === Object.keys(generated).length &&
+    Object.entries(generated).every(([field, value]) => isDeepStrictEqual(model[field], value) ||
+      (field === 'display_name' && model[field] === 'GPT-5.5' && generated.model === 'gpt-5.5'));
+}
+
+function hasAliasComments(text, alias) {
+  const { headers, entries } = indexText(text);
+  const path = ['models', alias];
+  return headers.some((header, i) => prefix(path, header.path) &&
+    text.slice(header.start, headers[i + 1]?.start ?? text.length).includes('#')) ||
+    entries.some((entry) => (prefix(path, entry.path) || (prefix(entry.path, path) && entry.node.container)) &&
+      text.slice(entry.start, entry.end).includes('#'));
 }
 
 export function mergeConfigModels(existing, models, port, { overrideBaseUrl = false } = {}) {
@@ -240,17 +263,33 @@ export function mergeConfigModels(existing, models, port, { overrideBaseUrl = fa
   const removed = new Set();
   let result = existing;
   for (const [alias, model] of Object.entries(config.models ?? {})) {
-    if ((alias.startsWith('chatgpt/') && isRetiredModel(alias.slice(8))) ||
-        (table(model) && (alias.startsWith('chatgpt/') || model.provider === 'kimi-gpt-bridge') && isRetiredModel(model.model))) {
+    const prefix = bridgeSlug(alias);
+    if ((prefix && isRetiredModel(alias.slice(prefix.length))) ||
+        (table(model) && (prefix || model.provider === 'kimi-gpt-bridge') && isRetiredModel(model.model))) {
       result = removeTable(result, ['models', alias]);
       delete expected.models[alias];
       removed.add(alias);
     }
   }
-  // Legacy naming also migrates when this model is absent from the new catalog.
-  if (Object.hasOwn(expected.models ?? {}, 'chatgpt/gpt-5.5') && !Object.hasOwn(defaults.models ?? {}, 'chatgpt/gpt-5.5')) {
-    defaults.models ??= {};
-    defaults.models['chatgpt/gpt-5.5'] = { display_name: 'GPT-5.5 (Legacy)' };
+  const referenced = new Set(modelReferences(config).map(([, alias]) => alias));
+  for (const [alias, fields] of Object.entries(defaults.models ?? {})) {
+    const oldAlias = `chatgpt/${fields.model}`;
+    if (oldAlias === alias || !Object.hasOwn(expected.models ?? {}, oldAlias)) continue;
+    if (Object.hasOwn(expected.models, alias) && !referenced.has(oldAlias) &&
+        isStockLegacyAlias(expected.models[oldAlias], fields) && !hasAliasComments(result, oldAlias)) {
+      result = removeTable(result, ['models', oldAlias]);
+      delete expected.models[oldAlias];
+    } else {
+      defaults.models[oldAlias] = fields;
+      if (!Object.hasOwn(expected.models, alias)) delete defaults.models[alias];
+    }
+  }
+  // Legacy naming also migrates when GPT-5.5 is absent from the new catalog.
+  for (const alias of ['chatgpt/gpt-5.5', 'kimi-gpt-bridge/gpt-5.5']) {
+    if (Object.hasOwn(expected.models ?? {}, alias) && !Object.hasOwn(defaults.models ?? {}, alias)) {
+      defaults.models ??= {};
+      defaults.models[alias] = { display_name: 'GPT-5.5 (Legacy)' };
+    }
   }
   for (const section of ['providers', 'models']) {
     if (Object.hasOwn(expected, section) && !table(expected[section])) throw unsafe([section]);
@@ -269,7 +308,8 @@ export function mergeConfigModels(existing, models, port, { overrideBaseUrl = fa
       for (const [field, proposed] of Object.entries(fields)) {
         const exists = Object.hasOwn(current, field);
         const replace = (section === 'providers' && field === 'base_url' && overrideBaseUrl) ||
-          (section === 'models' && alias === 'chatgpt/gpt-5.5' && field === 'display_name' && current[field] === 'GPT-5.5');
+          (section === 'models' && ['chatgpt/gpt-5.5', 'kimi-gpt-bridge/gpt-5.5'].includes(alias) &&
+            field === 'display_name' && current[field] === 'GPT-5.5');
         if (exists && !replace) continue;
         let value = proposed;
         if (field === 'default_effort' && Object.hasOwn(current, 'support_efforts')) {

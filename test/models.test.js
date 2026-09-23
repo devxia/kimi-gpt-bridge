@@ -153,7 +153,7 @@ test('buildConfigBlock renders markers, provider table and per-model TOML', () =
   assert.ok(block.startsWith(`${MARKER_START}\n`));
   assert.ok(block.endsWith(`${MARKER_END}\n`));
   assert.match(block, /\[providers\.kimi-gpt-bridge\]\ntype = "openai"\nbase_url = "http:\/\/127\.0\.0\.1:1456\/v1"\napi_key = "kimi-gpt-bridge"/);
-  const entry = parseToml(block).models['chatgpt/gpt-a'];
+  const entry = parseToml(block).models['kimi-gpt-bridge/gpt-a'];
   assert.equal(entry.model, 'gpt-a');
   assert.equal(entry.display_name, 'GPT A');
   assert.equal(entry.max_context_size, 272000);
@@ -163,7 +163,7 @@ test('buildConfigBlock renders markers, provider table and per-model TOML', () =
   assert.ok(!block.includes('max_input_size'));
   assert.ok(!block.includes('872000'));
   // gpt-a (priority 10) comes before gpt-b (priority 20).
-  assert.ok(block.indexOf('chatgpt/gpt-a') < block.indexOf('chatgpt/gpt-b'));
+  assert.ok(block.indexOf('kimi-gpt-bridge/gpt-a') < block.indexOf('kimi-gpt-bridge/gpt-b'));
   // Excluded tiers never make it into the config.
   assert.ok(!block.includes('ultra'));
   assert.ok(!block.includes('"off"'));
@@ -175,7 +175,7 @@ test('buildConfigBlock omits efforts lines when unknown', () => {
     1456,
   );
   const entry = block.slice(block.indexOf('[models.'));
-  assert.equal(parseToml(block).models['chatgpt/gpt-x'].display_name, 'X');
+  assert.equal(parseToml(block).models['kimi-gpt-bridge/gpt-x'].display_name, 'X');
   assert.ok(!entry.includes('max_context_size'));
   assert.ok(!entry.includes('support_efforts'));
   assert.ok(!entry.includes('default_effort'));
@@ -194,10 +194,10 @@ test('buildConfigBlock safely escapes dynamic strings and is valid TOML', () => 
   );
   const parsed = parseToml(block);
   assert.equal(parsed.providers['kimi-gpt-bridge'].base_url, 'http://127.0.0.1:1456"#/v1');
-  assert.equal(parsed.models[`chatgpt/${slug}`].model, slug);
-  assert.equal(parsed.models[`chatgpt/${slug}`].display_name, displayName);
-  assert.deepEqual(parsed.models[`chatgpt/${slug}`].support_efforts, [effort]);
-  assert.equal(parsed.models[`chatgpt/${slug}`].default_effort, effort);
+  assert.equal(parsed.models[`kimi-gpt-bridge/${slug}`].model, slug);
+  assert.equal(parsed.models[`kimi-gpt-bridge/${slug}`].display_name, displayName);
+  assert.deepEqual(parsed.models[`kimi-gpt-bridge/${slug}`].support_efforts, [effort]);
+  assert.equal(parsed.models[`kimi-gpt-bridge/${slug}`].default_effort, effort);
   assert.equal(Object.keys(parsed.models).length, 1);
   assert.throws(
     () => buildConfigBlock([{ slug: 'bad\ud800', efforts: [] }], 1456),
@@ -223,6 +223,10 @@ test('stripBridgeTables removes hoisted unmarked duplicates left by Kimi Code re
     'provider = "kimi-gpt-bridge"',
     'model = "gpt-9"',
     '',
+    '[models."kimi-gpt-bridge/gpt-10"]',
+    'provider = "kimi-gpt-bridge"',
+    'model = "gpt-10"',
+    '',
     '[models."other/x"]',
     'provider = "other"',
     'model = "x"',
@@ -231,6 +235,7 @@ test('stripBridgeTables removes hoisted unmarked duplicates left by Kimi Code re
   const stripped = stripBridgeTables(hoisted);
   assert.ok(!stripped.includes('kimi-gpt-bridge'));
   assert.ok(!stripped.includes('chatgpt/gpt-9'));
+  assert.ok(!stripped.includes('kimi-gpt-bridge/gpt-10'));
   assert.ok(stripped.includes('[providers.other]'));
   assert.ok(stripped.includes('api_key = "x"'));
   assert.ok(stripped.includes('[models."other/x"]'));
@@ -256,6 +261,8 @@ test('stripBridgeTables parses equivalent TOML header identities and preserves o
     'model = "literal"',
     `[ models . "chatgpt\\u002Fbasic" . overrides ] # escaped basic key`,
     'temperature = 1',
+    `[ models . 'kimi-gpt-bridge/fresh' ]`,
+    'model = "fresh"',
     `[ models . 'chatgptish/keep' ] # similar but not owned`,
     'provider = "other"',
     `[ providers . 'kimi-gpt-bridge-other' ]`,
@@ -271,6 +278,7 @@ test('stripBridgeTables parses equivalent TOML header identities and preserves o
   assert.ok(!stripped.includes('secret ='));
   assert.ok(!stripped.includes('model = "literal"'));
   assert.ok(!stripped.includes('temperature ='));
+  assert.ok(!stripped.includes('kimi-gpt-bridge/fresh'));
   assert.ok(stripped.includes("[ models . 'chatgptish/keep' ]"));
   assert.ok(stripped.includes("[ providers . 'kimi-gpt-bridge-other' ]"));
   assert.ok(stripped.includes("[ models . 'other/keep' ]"));
@@ -297,6 +305,7 @@ test('stripBridgeTables removes top-level dotted ownership assignments and their
     `models."chatgpt/old".provider = [`,
     `  "kimi-gpt-bridge",`,
     `]`,
+    `models."kimi-gpt-bridge/fresh".model = "fresh"`,
     `providers.other.type = "openai"`,
     `models."other/keep".provider = "other"`,
     `providers.kimi-gpt-bridge-other.type = "keep"`,
@@ -316,6 +325,7 @@ test('stripBridgeTables removes top-level dotted ownership assignments and their
   const parsed = parseToml(stripped);
   assert.equal(parsed.providers['kimi-gpt-bridge'], undefined);
   assert.equal(parsed.models['chatgpt/old'], undefined);
+  assert.equal(parsed.models['kimi-gpt-bridge/fresh'], undefined);
   assert.equal(parsed.providers.other.type, 'openai');
   assert.equal(parsed.models['other/keep'].provider, 'other');
   assert.equal(parsed.providers['kimi-gpt-bridge-other'].type, 'keep');
@@ -453,7 +463,7 @@ test('setup appends then replaces the marker block idempotently', () => {
     assert.match(first.stdout, /Not logged in/); // fallback list, no network
     const content1 = fs.readFileSync(configFile, 'utf8');
     assert.ok(content1.startsWith(MARKER_START));
-    assert.ok(content1.includes('chatgpt/gpt-5.6-terra'));
+    assert.ok(content1.includes('kimi-gpt-bridge/gpt-5.6-terra'));
 
     const second = run();
     assert.match(second.stdout, /Updated the kimi-gpt-bridge provider/);
@@ -574,15 +584,15 @@ test('fallback and live catalogs share the current model policy and valid config
   assert.deepEqual(selectModels(catalog, 'pro'), []);
   for (const models of [live, STATIC_FALLBACK_MODELS]) {
     const parsed = parseToml(buildConfigBlock(models, 1456));
-    assert.deepEqual(Object.keys(parsed.models), expectedIds.map((slug) => `chatgpt/${slug}`));
+    assert.deepEqual(Object.keys(parsed.models), expectedIds.map((slug) => `kimi-gpt-bridge/${slug}`));
     for (const slug of ['gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra']) {
-      const model = parsed.models[`chatgpt/${slug}`];
+      const model = parsed.models[`kimi-gpt-bridge/${slug}`];
       assert.equal(model.model, slug);
       assert.equal(model.default_effort, 'medium');
       assert.equal(model.max_context_size, 272000);
       assert.deepEqual(model.support_efforts, ['low', 'medium', 'high', 'xhigh', 'max']);
     }
-    const legacy = parsed.models['chatgpt/gpt-5.5'];
+    const legacy = parsed.models['kimi-gpt-bridge/gpt-5.5'];
     assert.equal(legacy.model, 'gpt-5.5');
     assert.equal(legacy.display_name, 'GPT-5.5 (Legacy)');
     assert.deepEqual(legacy.support_efforts, ['low', 'medium', 'high', 'xhigh']);
