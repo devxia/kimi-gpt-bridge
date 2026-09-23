@@ -19,6 +19,8 @@ import {
   stripBridgeTables,
   clearModelCache,
   modelsCachePath,
+  getModelIds,
+  saveModelsCache,
 } from '../src/models.js';
 import { saveAuth } from '../src/token-store.js';
 import { createBridgeServer } from '../src/server.js';
@@ -151,7 +153,12 @@ test('buildConfigBlock renders markers, provider table and per-model TOML', () =
   assert.ok(block.startsWith(`${MARKER_START}\n`));
   assert.ok(block.endsWith(`${MARKER_END}\n`));
   assert.match(block, /\[providers\.kimi-gpt-bridge\]\ntype = "openai"\nbase_url = "http:\/\/127\.0\.0\.1:1456\/v1"\napi_key = "kimi-gpt-bridge"/);
-  assert.match(block, /\[models\."chatgpt\/gpt-a"\]\nprovider = "kimi-gpt-bridge"\nmodel = "gpt-a"\nmax_context_size = 272000\ncapabilities = \[ "thinking", "tool_use", "image_in" \]\nsupport_efforts = \[ "medium", "xhigh" \]\ndefault_effort = "medium"/);
+  const entry = parseToml(block).models['chatgpt/gpt-a'];
+  assert.equal(entry.model, 'gpt-a');
+  assert.equal(entry.display_name, 'GPT A');
+  assert.equal(entry.max_context_size, 272000);
+  assert.deepEqual(entry.support_efforts, ['medium', 'xhigh']);
+  assert.equal(entry.default_effort, 'medium');
   // max_context_window is never emitted as max_input_size / max_context_size.
   assert.ok(!block.includes('max_input_size'));
   assert.ok(!block.includes('872000'));
@@ -168,7 +175,7 @@ test('buildConfigBlock omits efforts lines when unknown', () => {
     1456,
   );
   const entry = block.slice(block.indexOf('[models.'));
-  assert.match(entry, /\[models\."chatgpt\/gpt-x"\]\nprovider = "kimi-gpt-bridge"\nmodel = "gpt-x"\ncapabilities =/);
+  assert.equal(parseToml(block).models['chatgpt/gpt-x'].display_name, 'X');
   assert.ok(!entry.includes('max_context_size'));
   assert.ok(!entry.includes('support_efforts'));
   assert.ok(!entry.includes('default_effort'));
@@ -177,9 +184,10 @@ test('buildConfigBlock omits efforts lines when unknown', () => {
 test('buildConfigBlock safely escapes dynamic strings and is valid TOML', () => {
   const slug = 'gpt."quoted"\\path\n控制';
   const effort = 'hi"gh\\tier\t';
+  const displayName = 'GPT "quoted"\\name\n控制\u0001';
   const block = buildConfigBlock(
     [
-      { slug, contextWindow: 1000, defaultEffort: effort, efforts: [effort] },
+      { slug, displayName, contextWindow: 1000, defaultEffort: effort, efforts: [effort] },
       { slug, contextWindow: 2000, defaultEffort: 'duplicate', efforts: [] },
     ],
     '1456"#',
@@ -187,6 +195,7 @@ test('buildConfigBlock safely escapes dynamic strings and is valid TOML', () => 
   const parsed = parseToml(block);
   assert.equal(parsed.providers['kimi-gpt-bridge'].base_url, 'http://127.0.0.1:1456"#/v1');
   assert.equal(parsed.models[`chatgpt/${slug}`].model, slug);
+  assert.equal(parsed.models[`chatgpt/${slug}`].display_name, displayName);
   assert.deepEqual(parsed.models[`chatgpt/${slug}`].support_efforts, [effort]);
   assert.equal(parsed.models[`chatgpt/${slug}`].default_effort, effort);
   assert.equal(Object.keys(parsed.models).length, 1);
@@ -544,6 +553,75 @@ test('resolveClientVersion falls back to the floor on registry errors and bad pa
     fetchImpl: async () => new Response(JSON.stringify({ latest: '9.9.9' }), { status: 200 }),
   });
   assert.deepEqual(badPayload, { version: MODELS_CLIENT_VERSION, source: 'pinned' });
+});
+
+test('fallback and live catalogs share the current model policy and valid config identities', () => {
+  const expectedIds = ['gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'];
+  assert.deepEqual(STATIC_FALLBACK_MODELS.map((m) => m.slug), expectedIds);
+  const catalog = STATIC_FALLBACK_MODELS.map((m) => ({
+    slug: m.slug,
+    display_name: m.slug === 'gpt-5.5' ? 'GPT-5.5' : m.displayName,
+    visibility: 'list',
+    available_in_plans: ['plus'],
+    context_window: 272000,
+    max_context_window: 872000,
+    default_reasoning_level: m.slug === 'gpt-6-astra' ? 'low' : m.defaultEffort,
+    supported_reasoning_levels: [...m.efforts, 'ultra', 'off', 'none'].map((effort) => ({ effort })),
+  }));
+  catalog.push({ slug: 'gpt-5.4-mini', visibility: 'list' }, { slug: 'gpt-5.4-mini-max', visibility: 'list' });
+  const live = selectModels(catalog, 'plus');
+  assert.deepEqual(live, STATIC_FALLBACK_MODELS);
+  assert.deepEqual(selectModels(catalog, 'pro'), []);
+  for (const models of [live, STATIC_FALLBACK_MODELS]) {
+    const parsed = parseToml(buildConfigBlock(models, 1456));
+    assert.deepEqual(Object.keys(parsed.models), expectedIds.map((slug) => `chatgpt/${slug}`));
+    for (const slug of ['gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra']) {
+      const model = parsed.models[`chatgpt/${slug}`];
+      assert.equal(model.model, slug);
+      assert.equal(model.default_effort, 'medium');
+      assert.equal(model.max_context_size, 272000);
+      assert.deepEqual(model.support_efforts, ['low', 'medium', 'high', 'xhigh', 'max']);
+    }
+    const legacy = parsed.models['chatgpt/gpt-5.5'];
+    assert.equal(legacy.model, 'gpt-5.5');
+    assert.equal(legacy.display_name, 'GPT-5.5 (Legacy)');
+    assert.deepEqual(legacy.support_efforts, ['low', 'medium', 'high', 'xhigh']);
+    for (const model of models.filter((m) => m.slug.startsWith('gpt-5.6-'))) assert.match(model.description, /Older/);
+  }
+});
+
+test('model caches exclude retired IDs without injecting new models into a usable cache', async (t) => {
+  withIsolatedKgbHome(t);
+  clearModelCache();
+  t.after(clearModelCache);
+  saveModelsCache(['gpt-5.4-mini', 'gpt-5.4-mini-max', 'gpt-5.5', 'gpt-future', null, '']);
+  let calls = 0;
+  const fetchImpl = async () => { calls += 1; throw new Error('offline'); };
+  assert.deepEqual(await getModelIds({ fetchImpl }), ['gpt-5.5', 'gpt-future']);
+  fs.rmSync(modelsCachePath());
+  assert.deepEqual(await getModelIds({ fetchImpl }), ['gpt-5.5', 'gpt-future']);
+  assert.equal(calls, 0);
+});
+
+test('a cache with only retired models falls through to live catalog or offline fallback', async (t) => {
+  withIsolatedKgbHome(t);
+  t.after(clearModelCache);
+  process.env.KGB_CLIENT_VERSION = MODELS_CLIENT_VERSION;
+  t.after(() => delete process.env.KGB_CLIENT_VERSION);
+  saveAuth({ access: 'test-access', refresh: 'test-refresh', expires: Date.now() + 3600_000, planType: 'plus' });
+  for (const offline of [false, true]) {
+    clearModelCache();
+    saveModelsCache(['gpt-5.4-mini']);
+    let calls = 0;
+    const ids = await getModelIds({ fetchImpl: async (url) => {
+      calls += 1;
+      assert.match(url, /\/codex\/models\?client_version=/);
+      if (offline) throw new Error('offline');
+      return new Response(JSON.stringify({ models: [...CATALOG, { slug: 'gpt-5.4-mini', visibility: 'list' }] }));
+    } });
+    assert.equal(calls, 1);
+    assert.deepEqual(ids, offline ? STATIC_FALLBACK_MODELS.map((m) => m.slug) : ['gpt-a', 'gpt-b']);
+  }
 });
 
 test('selectModels keeps the supported max effort while dropping ultra/off/none', () => {

@@ -51,13 +51,39 @@ Browser OAuth waits up to 10 minutes. Device-code login waits up to 15 minutes.
 
 From then on the bridge server starts automatically with every session.
 
+## Update models in an existing installation
+
+When ChatGPT releases a new model or retires an old one, run these commands **one at a time in Kimi Code**:
+
+1. `/kimi-gpt-bridge:refresh` — wait for the model refresh to finish.
+2. `/reload` — reload the updated configuration.
+3. `/model` — choose an available `chatgpt/...` model.
+
+You do not need to uninstall the plugin or repeat setup. If refresh reports that you are not logged in, run `/kimi-gpt-bridge:login`, then retry refresh.
+
+**With plugin version 0.1.5 or later, refreshing preserves your existing custom model settings**, including reasoning effort, context size, custom display names, and extra settings. New models are added and missing settings are filled in. If you use an older plugin version, update the installed plugin through Kimi Code's plugin management before refreshing to get this protection.
+
+If an old model is no longer available:
+
+- Switch to an available model with `/model`.
+- If refresh reports that a retired model is still referenced, replace the references it lists in your main/secondary model settings, then run refresh and `/reload` again. A refused refresh leaves your config unchanged.
+- Models explicitly retired by the plugin are removed when no longer referenced. A model merely missing from ChatGPT's latest list stays in your config to preserve its settings. If you no longer want that entry, remove its `[models."chatgpt/<old-model>"]` configuration and any references from `config.toml`, then run `/reload`.
+
+If a new model still does not appear, inspect the models currently offered to your account without changing your config:
+
+```bash
+node "${KIMI_CODE_HOME:-$HOME/.kimi-code}/plugins/managed/kimi-gpt-bridge/src/cli.js" models list
+```
+
+Only models available to your account can be added by a live refresh. To refresh from a terminal instead, run the same command with `models sync` in place of `models list`, then return to Kimi Code and run `/reload` and `/model`.
+
 ## Command reference
 
 | Slash command | CLI equivalent | What it does |
 |---|---|---|
 | `/kimi-gpt-bridge:login` | `login [--device]` | ChatGPT OAuth login; `--device` uses the 15-minute headless flow |
-| `/kimi-gpt-bridge:setup` | `setup [--port N]` | Write/update the provider and model entries after real TOML validation |
-| `/kimi-gpt-bridge:refresh` | `models sync` | Refresh models, refusing changes that would invalidate configured default-model references |
+| `/kimi-gpt-bridge:setup` | `setup [--port N]` | Add provider/models and fill missing settings, preserving existing customizations |
+| `/kimi-gpt-bridge:refresh` | `models sync [--port N]` | Merge catalog additions and explicit retirements, preserving customizations and validating final model references |
 | — | `models list` | Show the live model catalog without changing config |
 | `/kimi-gpt-bridge:status` | `status` | Login state and best-effort subscription usage |
 | `/kimi-gpt-bridge:start` | `ensure-running` | Start the bridge on `KGB_PORT` (default 1456) if its health identity is absent |
@@ -68,9 +94,35 @@ From then on the bridge server starts automatically with every session.
 
 CLI commands run as `node ~/.kimi-code/plugins/managed/kimi-gpt-bridge/src/cli.js <command>`.
 
+## Model policy
+
+The live catalog still follows your account's plan and upstream visibility, rather than a fixed allowlist. The offline fallback includes:
+
+| Model | Default effort | Supported efforts |
+|---|---|---|
+| GPT-6-Sol / GPT-6-Luna | `medium` | `low`, `medium`, `high`, `xhigh`, `max` |
+| GPT-6-Astra | `medium` (bridge override) | `low`, `medium`, `high`, `xhigh`, `max` |
+| GPT-5.6-Sol (Older) | `low` | `low`, `medium`, `high`, `xhigh`, `max` |
+| GPT-5.6-Terra / GPT-5.6-Luna (Older) | `medium` | `low`, `medium`, `high`, `xhigh`, `max` |
+| GPT-5.5 (Legacy) | `medium` | `low`, `medium`, `high`, `xhigh` |
+
+These fallback models use a **272000-token** context window. New live entries use `context_window`, not `max_context_window`; existing user-configured windows are preserved. GPT-5.5 gets the display name `GPT-5.5 (Legacy)` when its name is missing or still `GPT-5.5`. Custom display names and its `chatgpt/gpt-5.5` alias remain unchanged.
+
+GPT-5.4-Mini is retired: it is excluded from live, fallback, and cached lists. Both generation endpoints return HTTP 400 (`model_retired`) for `gpt-5.4-mini`, including the supported Chat effort suffixes. Other unknown model IDs continue to pass through. A usable cached list is only filtered, never padded with newly added models; if nothing remains, the bridge tries the live catalog and then the offline fallback.
+
+Astra uses `medium` when no effort is supplied on either generation endpoint. Explicit Chat `reasoning_effort` takes precedence over a model suffix; either overrides the default. Responses preserves explicit `reasoning.effort` and other reasoning fields. Config refresh preserves an existing Astra `default_effort`; `medium` is the default for new entries or missing settings, subject to the configured supported efforts.
+
+If Mini is referenced by a main or secondary default/model map, `setup` and `models sync` refuse to write and leave the original file unchanged. Select a replacement yourself before refreshing; unreferenced Mini entries are removed safely. Other existing models, including GPT-5.5, remain configured even if the latest catalog omits them. This preserves their settings and references; it does not guarantee that upstream will still accept requests for them.
+
+Editing this checkout does **not** update the installed managed plugin. Update that copy separately, restart its running bridge, and refresh model config for these changes to take effect in Kimi Code.
+
 ## Configuration safety
 
-Kimi Code may rewrite `config.toml`, move provider/model tables, and remove marker comments. Setup, refresh, and teardown therefore locate bridge entries by TOML table identity rather than markers alone. Writes are checked with a real TOML parser and replace the file atomically. A model refresh is rejected instead of overwriting config if it would leave `default_model`, `[secondary_model].default_model`, or `[secondary_model.models]` pointing at removed `chatgpt/...` entries.
+`setup` and `models sync` merge additions into the existing configuration. They add new models and fill missing fields while preserving existing model/provider values, extra fields, nested settings, and comments. They do not replace the whole bridge block. For example, an existing Astra `default_effort = "high"` stays `high` after refresh. Existing models absent from the latest catalog are retained unless explicitly retired.
+
+The provider's existing URL and custom settings are preserved. An explicit `--port` or nonempty `KGB_PORT` overrides the provider URL; `--port` takes precedence. Missing fields use generated defaults, including `api_key = "kimi-gpt-bridge"` for a new provider.
+
+Kimi Code may rewrite `config.toml`, move provider/model tables, and remove marker comments. Config updates therefore use decoded TOML identities rather than markers alone. The complete merged candidate is checked with a real TOML parser and installed atomically. Main and secondary model references are checked against the final merged configuration, so a retained model absent from the latest catalog remains valid. Missing or retired references cause a refusal to write, leaving the original file unchanged. Teardown still removes bridge entries.
 
 Server process records are scoped by port. Lifecycle commands verify the `/health` service identity before trusting or stopping a PID, avoiding collisions with unrelated loopback services.
 

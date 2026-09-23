@@ -242,6 +242,67 @@ test('setup refuses stale chatgpt references and preserves config.toml byte-for-
   }
 });
 
+test('setup and live sync retire mini safely while retaining Legacy references', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-retire-mini-'));
+  const kimiHome = path.join(tmpDir, 'kimi');
+  const configFile = path.join(kimiHome, 'config.toml');
+  const oldTables = '\n[models."chatgpt/gpt-5.4-mini"]\nprovider = "kimi-gpt-bridge"\nmodel = "gpt-5.4-mini"\n';
+  const catalog = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ models: ['gpt-5.4-mini', 'gpt-5.5', 'gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra'].map((slug) => ({
+      slug, visibility: 'list', default_reasoning_level: 'low',
+    })) }));
+  });
+  try {
+    await listen(catalog);
+    fs.mkdirSync(kimiHome, { recursive: true });
+    for (const command of [['setup'], ['models', 'sync']]) {
+      if (command[0] === 'models') {
+        fs.mkdirSync(path.join(tmpDir, 'kgb'), { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, 'kgb', 'auth.json'), JSON.stringify({
+          access: 'offline-access', refresh: 'offline-refresh', expires: Date.now() + 3_600_000,
+        }));
+      }
+      const env = { KGB_UPSTREAM_BASE: `http://127.0.0.1:${catalog.address().port}`, KGB_CLIENT_VERSION: '0.156.0' };
+      for (const reference of [
+        'default_model = "chatgpt/gpt-5.4-mini"\n',
+        '[secondary_model]\ndefault_model = "chatgpt/gpt-5.4-mini"\n',
+        '[secondary_model.models]\n"chatgpt/gpt-5.4-mini" = 1\n',
+      ]) {
+        const original = reference + oldTables;
+        fs.writeFileSync(configFile, original);
+        const result = await runCliAsync(tmpDir, command, env);
+        assert.notEqual(result.status, 0);
+        assert.match(`${result.stdout}\n${result.stderr}`, /gpt-5\.4-mini/);
+        assert.equal(fs.readFileSync(configFile, 'utf8'), original);
+      }
+      for (const reference of ['', 'default_model = "chatgpt/gpt-5.5"\n[secondary_model]\ndefault_model = "chatgpt/gpt-5.5"\n[secondary_model.models]\n"chatgpt/gpt-5.5" = 1\n']) {
+        fs.writeFileSync(configFile, reference + oldTables);
+        const result = await runCliAsync(tmpDir, command, env);
+        assert.equal(result.status, 0, result.stderr);
+        const text = fs.readFileSync(configFile, 'utf8');
+        assert.doesNotMatch(text, /gpt-5\.4-mini/);
+        const parsed = spawnSync('python3', ['-c', 'import json, sys, tomllib; json.dump(tomllib.loads(sys.stdin.read()), sys.stdout)'], { input: text, encoding: 'utf8' });
+        assert.equal(parsed.status, 0, parsed.stderr);
+        const config = JSON.parse(parsed.stdout);
+        assert.equal(config.models['chatgpt/gpt-5.5'].model, 'gpt-5.5');
+        assert.equal(config.models['chatgpt/gpt-5.5'].display_name, 'GPT-5.5 (Legacy)');
+        assert.equal(config.models['chatgpt/gpt-6-astra'].default_effort, 'medium');
+        assert.ok(config.models['chatgpt/gpt-6-sol']);
+        assert.ok(config.models['chatgpt/gpt-6-luna']);
+        if (reference) {
+          assert.equal(config.default_model, 'chatgpt/gpt-5.5');
+          assert.equal(config.secondary_model.default_model, 'chatgpt/gpt-5.5');
+          assert.equal(config.secondary_model.models['chatgpt/gpt-5.5'], 1);
+        }
+      }
+    }
+  } finally {
+    await closeServer(catalog);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('setup uses tomllib references for inline tables and multiline strings without modifying config', () => {
   const fixtures = [
     'secondary_model = { default_model = "chatgpt/inline-retired", models = { "chatgpt/inline-map" = 1 } }\n',
@@ -817,13 +878,14 @@ test('a hung python3 makes setup fail with a named timeout instead of blocking',
   const binDir = path.join(tmpDir, 'bin');
   try {
     fs.mkdirSync(binDir, { recursive: true });
-    // The reference scanner contains "json.dump"; let the real python run it
-    // and hang only the validation call so the refusal is exercised.
+    // Merge parsing contains "json.dump"; hang only atomic-write validation.
+    const python = spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' });
+    assert.equal(python.status, 0, python.stderr);
     fs.writeFileSync(path.join(binDir, 'python3'), [
       '#!/bin/sh',
       'case "$2" in',
-      '  *json.dump*) exec /usr/bin/python3 "$@" ;;',
-      '  *) sleep 60 ;;',
+      `  *json.dump*) exec "${python.stdout.trim()}" "$@" ;;`,
+      '  *) exec sleep 60 ;;',
       'esac',
       '',
     ].join('\n'), { mode: 0o755 });
@@ -954,6 +1016,167 @@ test('an explicitly set KGB_PORT wins over the port already in config.toml', () 
     assert.equal(third.status, 0, third.stderr);
     config = fs.readFileSync(configFile, 'utf8');
     assert.match(config, /127\.0\.0\.1:7000/);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+function parseConfig(text) {
+  const parsed = spawnSync('python3', ['-c', 'import json, sys, tomllib; json.dump(tomllib.loads(sys.stdin.read()), sys.stdout)'], { input: text, encoding: 'utf8' });
+  assert.equal(parsed.status, 0, parsed.stderr);
+  return JSON.parse(parsed.stdout);
+}
+
+test('offline setup and live sync incrementally migrate user configuration and retain missing catalog models', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-merge-'));
+  const configFile = path.join(tmpDir, 'kimi', 'config.toml');
+  let slugs = ['gpt-6-astra', 'gpt-5.5', 'gpt-live-new', 'gpt-5.4-mini'];
+  const catalog = http.createServer((req, res) => {
+    assert.match(req.url, /^\/codex\/models\?client_version=/);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ models: slugs.map((slug) => ({
+      slug, visibility: 'list', context_window: 272000, default_reasoning_level: 'low',
+      supported_reasoning_levels: ['low', 'medium', 'high'].map((effort) => ({ effort })),
+    })) }));
+  });
+  const original = `# user preamble
+default_model = 'chatgpt/omitted'
+secondary_model = { default_model = 'chatgpt/omitted', models = { 'chatgpt/omitted' = 0 } }
+[ providers . 'kimi-gpt-bridge' ] # provider note
+base_url = 'https://remote.example:5999/a/custom/v2?q=1' # exact endpoint
+api_key = ''
+type = 'custom'
+custom_flag = false
+[providers.kimi-gpt-bridge.headers]
+X-Header = 'kept'
+[models.'chatgpt/gpt-6-astra'] # Astra note
+default_effort = 'high'
+support_efforts = ['high']
+capabilities = []
+max_context_size = 0
+extra.flag = false
+[models.'chatgpt/gpt-5.5']
+display_name = 'GPT-5.5' # Legacy note
+[models.'chatgpt/omitted']
+provider = 'kimi-gpt-bridge'
+model = 'omitted'
+note = '''keep this
+[models.fake]
+'''
+[models.'chatgpt/omitted'.extra]
+value = 0
+[models.'chatgpt/gpt-5.4-mini']
+model = 'gpt-5.4-mini'
+[models.mini-alias]
+provider = 'kimi-gpt-bridge'
+model = 'gpt-5.4-mini-max'
+[unrelated]
+keep = true
+`;
+  try {
+    await listen(catalog);
+    fs.mkdirSync(path.dirname(configFile), { recursive: true });
+    const env = { KGB_UPSTREAM_BASE: `http://127.0.0.1:${catalog.address().port}`, KGB_CLIENT_VERSION: '0.156.0', KGB_PORT: '' };
+    for (const command of [['setup'], ['models', 'sync']]) {
+      if (command[0] === 'models') {
+        fs.mkdirSync(path.join(tmpDir, 'kgb'), { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, 'kgb', 'auth.json'), JSON.stringify({ access: 'offline', refresh: 'offline', expires: Date.now() + 3_600_000 }));
+      }
+      fs.writeFileSync(configFile, original);
+      const run = await runCliAsync(tmpDir, command, env);
+      assert.equal(run.status, 0, run.stderr);
+      if (command[0] === 'setup') assert.match(run.stdout, /Not logged in/);
+      const text = fs.readFileSync(configFile, 'utf8');
+      const before = parseConfig(original);
+      const after = parseConfig(text);
+      assert.deepEqual(after.providers, before.providers);
+      assert.equal(after.default_model, before.default_model);
+      assert.deepEqual(after.secondary_model, before.secondary_model);
+      assert.deepEqual(after.models['chatgpt/omitted'], before.models['chatgpt/omitted']);
+      for (const [key, value] of Object.entries(before.models['chatgpt/gpt-6-astra'])) assert.deepEqual(after.models['chatgpt/gpt-6-astra'][key], value);
+      assert.equal(after.models['chatgpt/gpt-6-astra'].model, 'gpt-6-astra');
+      assert.equal(after.models['chatgpt/gpt-5.5'].display_name, 'GPT-5.5 (Legacy)');
+      assert.equal(after.models['chatgpt/gpt-5.4-mini'], undefined);
+      assert.equal(after.models['mini-alias'], undefined);
+      assert.ok(text.includes("base_url = 'https://remote.example:5999/a/custom/v2?q=1' # exact endpoint"));
+      for (const comment of ['# user preamble', '# provider note', '# Astra note', '# Legacy note']) assert.ok(text.includes(comment));
+      assert.ok(text.includes("note = '''keep this\n[models.fake]\n'''"));
+      if (command[0] === 'models') {
+        assert.equal(after.models['chatgpt/gpt-6-sol'], undefined, 'live sync must not pad with fallback models');
+        assert.equal(after.models['chatgpt/gpt-live-new'].max_context_size, 272000);
+      }
+      const repeat = await runCliAsync(tmpDir, command, env);
+      assert.equal(repeat.status, 0, repeat.stderr);
+      assert.equal(fs.readFileSync(configFile, 'utf8'), text);
+    }
+    // A disappearing catalog entry remains configured and usable as default.
+    slugs = ['gpt-live-new'];
+    let run = await runCliAsync(tmpDir, ['models', 'sync'], env);
+    assert.equal(run.status, 0, run.stderr);
+    let text = fs.readFileSync(configFile, 'utf8');
+    assert.equal(parseConfig(text).models['chatgpt/gpt-6-astra'].default_effort, 'high');
+    // Both explicit mechanisms update the URL, with --port taking precedence.
+    run = await runCliAsync(tmpDir, ['models', 'sync'], { ...env, KGB_PORT: '7001' });
+    assert.equal(run.status, 0, run.stderr);
+    text = fs.readFileSync(configFile, 'utf8');
+    assert.equal(parseConfig(text).providers['kimi-gpt-bridge'].base_url, 'http://127.0.0.1:7001/v1');
+    run = await runCliAsync(tmpDir, ['models', 'sync', '--port', '7002'], { ...env, KGB_PORT: 'invalid-but-overridden' });
+    assert.equal(run.status, 0, run.stderr);
+    text = fs.readFileSync(configFile, 'utf8');
+    assert.equal(parseConfig(text).providers['kimi-gpt-bridge'].base_url, 'http://127.0.0.1:7002/v1');
+    assert.ok(text.includes('# exact endpoint'));
+    assert.deepEqual(parseConfig(text).providers['kimi-gpt-bridge'].headers, { 'X-Header': 'kept' });
+  } finally {
+    await closeServer(catalog);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('setup refuses unsafe TOML shapes and retired custom main/secondary aliases byte-for-byte', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-merge-refusal-'));
+  const configFile = path.join(tmpDir, 'kimi', 'config.toml');
+  const miniAlias = "\n[models.custom-mini]\nprovider = 'kimi-gpt-bridge'\nmodel = 'gpt-5.4-mini-high'\n";
+  try {
+    fs.mkdirSync(path.dirname(configFile), { recursive: true });
+    for (const original of [
+      `default_model = 'custom-mini'\n${miniAlias}`,
+      `secondary_model = { default_model = 'custom-mini' }\n${miniAlias}`,
+      `secondary_model.models.custom-mini = 1\n${miniAlias}`,
+      `[[models.'chatgpt/gpt-6-astra']]\nmodel = 'gpt-6-astra'\n`,
+      `providers = false\n`,
+    ]) {
+      parseConfig(original);
+      fs.writeFileSync(configFile, original);
+      const result = runCli(tmpDir, ['setup'], { KGB_PORT: '' });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /original config.toml is unchanged/);
+      assert.equal(fs.readFileSync(configFile, 'utf8'), original);
+      assert.deepEqual(fs.readdirSync(path.dirname(configFile)), ['config.toml']);
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('setup handles inline and dotted models, custom Legacy names and consistent missing Astra defaults', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kgb-cli-merge-inline-'));
+  const configFile = path.join(tmpDir, 'kimi', 'config.toml');
+  const original = `# inline config\nproviders = { 'kimi-gpt-bridge' = { api_key = '', base_url = 'https://example.test/path' } }\nmodels = { 'chatgpt/gpt-6-astra'.support_efforts = ['high'], 'chatgpt/gpt-5.5' = { display_name = 'Personal name', extra = { enabled = false } } }\n`;
+  try {
+    fs.mkdirSync(path.dirname(configFile), { recursive: true });
+    fs.writeFileSync(configFile, original);
+    let run = runCli(tmpDir, ['setup'], { KGB_PORT: '' });
+    assert.equal(run.status, 0, run.stderr);
+    const text = fs.readFileSync(configFile, 'utf8');
+    const config = parseConfig(text);
+    assert.equal(config.models['chatgpt/gpt-6-astra'].default_effort, 'high');
+    assert.equal(config.models['chatgpt/gpt-5.5'].display_name, 'Personal name');
+    assert.deepEqual(config.models['chatgpt/gpt-5.5'].extra, { enabled: false });
+    assert.ok(text.startsWith('# inline config\n'));
+    assert.equal(config.providers['kimi-gpt-bridge'].base_url, 'https://example.test/path');
+    run = runCli(tmpDir, ['setup'], { KGB_PORT: ' ' });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(fs.readFileSync(configFile, 'utf8'), text);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

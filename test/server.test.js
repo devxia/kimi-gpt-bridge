@@ -205,6 +205,74 @@ test('chat defaults to non-streaming and stream:false also returns JSON', async 
   }
 });
 
+test('retired mini and its supported suffixes return 400 without contacting upstream', async () => {
+  for (const send of [postChat, postResponses]) {
+    for (const suffix of ['', '-minimal', '-low', '-medium', '-high', '-xhigh', '-max']) {
+      for (const stream of [undefined, false, true]) {
+        lastUpstream = undefined;
+        const res = await send({ model: `gpt-5.4-mini${suffix}`, messages: [], input: 'hi', stream });
+        assert.equal(res.status, 400);
+        const body = await res.json();
+        assert.equal(body.error.type, 'invalid_request_error');
+        assert.equal(body.error.code, 'model_retired');
+        assert.match(body.error.message, /gpt-5\.4-mini.*no longer supported/);
+        assert.equal(lastUpstream, undefined);
+      }
+    }
+  }
+});
+
+test('Sol, Luna, Legacy and unknown model IDs still pass through both generation routes', async () => {
+  for (const send of [postChat, postResponses]) {
+    for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-5.5', 'gpt-future', 'gpt-5.4-mini-next']) {
+      for (const stream of [undefined, false, true]) {
+        const res = await send({ model, messages: [{ role: 'user', content: 'hi' }], input: 'hi', stream });
+        assert.equal(res.status, 200);
+        assert.equal(lastUpstream.body.model, model);
+        assert.equal(lastUpstream.body.reasoning, undefined);
+        assert.equal(lastUpstream.body.store, false);
+        assert.equal(lastUpstream.body.stream, true);
+        assert.deepEqual(lastUpstream.body.include, ['reasoning.encrypted_content']);
+        if (stream) {
+          assert.match(res.headers.get('content-type'), /text\/event-stream/);
+          const text = await res.text();
+          if (send === postChat) assert.ok(text.endsWith('data: [DONE]\n\n'));
+          else assert.equal(text, sse(TEXT_SSE));
+        } else {
+          assert.match(res.headers.get('content-type'), /application\/json/);
+          const body = await res.json();
+          if (send === postChat) assert.equal(body.choices[0].message.content, 'Hello world');
+          else assert.equal(body.status, 'completed');
+        }
+      }
+    }
+  }
+});
+
+test('Astra defaults and explicit overrides reach upstream on both routes', async () => {
+  for (const stream of [undefined, false, true]) {
+    for (const effort of [undefined, 'low', 'high', 'xhigh', 'max']) {
+      const chat = await postChat({ model: 'gpt-6-astra', messages: [], reasoning_effort: effort, stream });
+      assert.equal(chat.status, 200);
+      await chat.text();
+      assert.deepEqual(lastUpstream.body.reasoning, { effort: effort ?? 'medium', summary: 'auto' });
+      const responses = await postResponses({ model: 'gpt-6-astra', input: 'hi', reasoning: { effort, summary: 'detailed' }, stream });
+      assert.equal(responses.status, 200);
+      await responses.text();
+      assert.deepEqual(lastUpstream.body.reasoning, { effort: effort ?? 'medium', summary: 'detailed' });
+    }
+    const suffix = await postChat({ model: 'gpt-6-astra-max', messages: [], stream });
+    assert.equal(suffix.status, 200);
+    await suffix.text();
+    assert.equal(lastUpstream.body.model, 'gpt-6-astra');
+    assert.equal(lastUpstream.body.reasoning.effort, 'max');
+    const absent = await postResponses({ model: 'gpt-6-astra', input: 'hi', stream });
+    assert.equal(absent.status, 200);
+    await absent.text();
+    assert.deepEqual(lastUpstream.body.reasoning, { effort: 'medium' });
+  }
+});
+
 test('tool calls stream as a complete tool_call chunk with finish_reason tool_calls', async () => {
   const res = await postChat({
     model: 'gpt-5.4',

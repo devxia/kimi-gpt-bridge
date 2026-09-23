@@ -40,9 +40,11 @@ https://chatgpt.com/backend-api/codex/responses
 3. Run `/reload`, then choose `chatgpt/<slug>` with `/model`.
 4. The SessionStart hook auto-starts the bridge; `ensure-running` starts it manually.
 
-When logged in, `setup` syncs models visible to the account plan and records their context windows and reasoning efforts. `models sync` refreshes config; `models list` only inspects the live catalog. Setup can use the built-in fallback list when logged out or the catalog is unavailable. `max` effort is supported when a model advertises it; `ultra`, `off`, and `none` remain hidden.
+When logged in, `setup` discovers models visible to the account plan. `models sync` merges catalog additions into config; `models list` only inspects the live catalog. Setup can use the built-in fallback list when logged out or the catalog is unavailable. New models receive catalog context windows and reasoning efforts. Existing model/provider values, unknown fields, nested settings, and comments are preserved; only missing fields receive defaults. Existing models omitted from the catalog remain configured unless explicitly retired. Catalog defaults printed by sync are not a replacement for preserved user settings. `max` effort is supported when advertised; generated efforts exclude `ultra`, `off`, and `none`.
 
-Config updates identify bridge tables even after Kimi Code moves them or removes marker comments. The complete candidate is validated by a real TOML parser and installed atomically. A refresh refuses to overwrite config if removing models would invalidate `default_model`, `[secondary_model].default_model`, or `[secondary_model.models]` references.
+Astra's existing default effort is preserved; medium is used for new or missing settings when compatible with configured efforts. GPT-5.5 remains selectable and receives the Legacy label only if its display name is missing or still the old stock name. Custom names remain unchanged. The provider's exact URL is preserved unless `--port` or nonempty `KGB_PORT` explicitly overrides it.
+
+Config updates identify bridge entries even after Kimi Code moves them or removes marker comments. The complete merged candidate is validated by a real TOML parser and installed atomically. Main and secondary references are checked against the final merged configuration, not only the catalog. Missing or retired references (including GPT-5.4-Mini) cause refusal to write, leaving the original unchanged.
 
 ## API behavior
 
