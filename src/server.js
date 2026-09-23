@@ -17,6 +17,7 @@ import { callUpstream, upstreamError, VERSION } from './upstream.js';
 import { loadAuth, kgbHome } from './token-store.js';
 import { getModelIds } from './models.js';
 import { atomicWriteFile } from './util.js';
+import { defaultEffortForModel, isRetiredModel } from './model-policy.js';
 
 const SERVICE = 'kimi-gpt-bridge';
 const MODEL_CREATED = 1750000000;
@@ -145,6 +146,12 @@ function requireGenerationHeaders(req) {
   const contentType = String(req.headers['content-type'] ?? '').split(';', 1)[0].trim().toLowerCase();
   if (contentType !== 'application/json') {
     throw bridgeError(415, 'Content-Type must be application/json', 'invalid_request_error', 'unsupported_media_type');
+  }
+}
+
+function requireSupportedModel(model) {
+  if (isRetiredModel(model)) {
+    throw bridgeError(400, 'gpt-5.4-mini is no longer supported by kimi-gpt-bridge. Choose another model.', 'invalid_request_error', 'model_retired');
   }
 }
 
@@ -305,6 +312,7 @@ export function createBridgeServer({
       if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
         requireGenerationHeaders(req);
         const chatReq = await readJsonBody(req, maxBodyBytes);
+        requireSupportedModel(chatReq.model);
         const cacheKey = reasoningCacheKey(req, sessionId, chatReq.messages);
         const translateOptions = { promptCacheKey: sessionId, reasoningCacheKey: cacheKey };
         const responsesBody = chatRequestToResponsesBody(chatReq, translateOptions);
@@ -351,8 +359,13 @@ export function createBridgeServer({
         streamErrorFormat = 'responses';
         requireGenerationHeaders(req);
         const body = await readJsonBody(req, maxBodyBytes);
+        requireSupportedModel(body.model);
         const include = new Set([...(Array.isArray(body.include) ? body.include : []), 'reasoning.encrypted_content']);
         const passthrough = { ...body, store: false, stream: true, include: [...include] };
+        const defaultEffort = defaultEffortForModel(body.model);
+        if (body.reasoning?.effort == null && defaultEffort) {
+          passthrough.reasoning = { ...body.reasoning, effort: defaultEffort };
+        }
         const upstream = await callUpstream(passthrough, {
           sessionId,
           fetchImpl,

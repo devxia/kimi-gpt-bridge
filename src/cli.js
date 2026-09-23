@@ -32,11 +32,10 @@ import {
   fetchModelCatalog,
   resolveClientVersion,
   selectModels,
-  buildConfigBlock,
-  upsertConfigBlock,
   stripBridgeTables,
   saveModelsCache,
 } from './models.js';
+import { mergeConfigModels } from './config-merge.js';
 
 export const SERVICE = 'kimi-gpt-bridge';
 const CLI_PATH = fileURLToPath(import.meta.url);
@@ -462,26 +461,20 @@ function writeKimiConfig(configFile, content) {
   atomicWriteFile(configFile, content, { validate: validateTomlFile });
 }
 
-function writeConfigBlock(models, port = getPort()) {
+function writeConfigBlock(models, explicitPort) {
   const configFile = kimiConfigPath();
   const existing = fs.existsSync(configFile) ? fs.readFileSync(configFile, 'utf8') : '';
-  const available = new Set(models.map((model) => `chatgpt/${model.slug}`));
-  const stale = readTomlModelReferences(configFile).filter(({ model }) => !available.has(model));
-  if (stale.length) {
-    const details = stale.map((reference) => `  - ${describeModelReference(reference)}`).join('\n');
-    throw new Error(
-      `Refusing to update config.toml because these settings reference models absent from the new catalog:\n${details}\nThe original config.toml is unchanged. Choose available models and retry.`,
-    );
-  }
-  const replacing = stripBridgeTables(existing) !== existing;
-  const candidate = upsertConfigBlock(existing, buildConfigBlock(models, port));
+  const port = resolveWritePort(explicitPort);
+  const overrideBaseUrl = explicitPort != null || (process.env.KGB_PORT ?? '').trim() !== '';
+  const candidate = mergeConfigModels(existing, models, port, { overrideBaseUrl });
+  const replacing = existing !== '';
   writeKimiConfig(configFile, candidate);
   return { configFile, replacing };
 }
 
 async function cmdSetup(flags = {}) {
   const models = await resolveModels();
-  const { configFile, replacing } = writeConfigBlock(models, resolveWritePort(flags.port));
+  const { configFile, replacing } = writeConfigBlock(models, flags.port);
   console.log(`${replacing ? 'Updated' : 'Added'} the kimi-gpt-bridge provider in ${configFile}`);
   console.log('\nNext steps:');
   console.log('  1. Run `/reload` in Kimi Code.');
@@ -532,9 +525,10 @@ async function cmdModels(args) {
     return;
   }
 
-  const { configFile, replacing } = writeConfigBlock(models, resolveWritePort(flags.port));
+  const { configFile } = writeConfigBlock(models, flags.port);
   saveModelsCache(models.map((m) => m.slug));
-  console.log(`${replacing ? 'Updated' : 'Added'} ${models.length} models in ${configFile}:`);
+  console.log(`Merged ${models.length} catalog models into ${configFile}; existing custom settings were preserved.`);
+  console.log('Catalog defaults below may differ from your preserved model settings:');
   for (const m of models) printModelLine(m);
   console.log('\nRun `/reload` in Kimi Code, then pick a model with `/model`.');
 }

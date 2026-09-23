@@ -12,9 +12,11 @@ Configure Kimi Code to use the bridge:
 
    If that path does not exist, locate the kimi-gpt-bridge checkout and run `src/cli.js setup` there.
 
-2. Setup writes a `kimi-gpt-bridge` provider with `api_key = "kimi-gpt-bridge"` plus one `chatgpt/<slug>` table per model. When logged in it syncs the live catalog; when logged out or the catalog is unavailable it uses the built-in fallback list.
+2. Setup adds a `kimi-gpt-bridge` provider with `api_key = "kimi-gpt-bridge"` when absent and registers new `chatgpt/<slug>` models. When logged in it uses the live catalog; when logged out or the catalog is unavailable it uses the built-in fallback list.
 
-   Existing bridge entries are found by TOML table identity even if Kimi Code moved them or deleted marker comments. The complete candidate config is parsed as TOML and installed atomically. Setup does not change `default_model`.
+   Existing model/provider values, unknown fields, nested settings, and comments are preserved; only missing fields receive defaults. Existing models absent from the catalog are retained unless explicitly retired. Astra's existing effort and GPT-5.5's custom display name are preserved. The existing provider URL changes only with an explicit `--port` or nonempty `KGB_PORT`.
+
+   Bridge entries are found by TOML identity even if Kimi Code moved them or deleted marker comments. The complete merged candidate is parsed as TOML and installed atomically. Setup does not change main or secondary model selections. Missing or retired model references cause refusal to write, leaving the original file unchanged.
 
 3. Report the generated models, then tell the user to:
    - run `/reload`, and

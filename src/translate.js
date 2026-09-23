@@ -1,21 +1,11 @@
 // Pure translation between OpenAI Chat Completions and the Codex Responses API.
 import crypto from 'node:crypto';
 
-export const EFFORT_SUFFIXES = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+import { defaultEffortForModel, parseModelAndEffort } from './model-policy.js';
+export { EFFORT_SUFFIXES, parseModelAndEffort } from './model-policy.js';
 
 const MAX_REASONING_CACHE_ENTRIES = 128;
 const encryptedReasoningCache = new Map();
-
-// `gpt-5.4-high` → { model: 'gpt-5.4', effort: 'high' }
-export function parseModelAndEffort(rawModel) {
-  const raw = String(rawModel ?? '');
-  for (const suffix of EFFORT_SUFFIXES) {
-    if (raw.endsWith(`-${suffix}`)) {
-      return { model: raw.slice(0, -(suffix.length + 1)), effort: suffix };
-    }
-  }
-  return { model: raw, effort: undefined };
-}
 
 function textOf(content) {
   if (content == null) return '';
@@ -286,7 +276,7 @@ export function chatRequestToResponsesBody(req, { promptCacheKey, reasoningCache
   };
 
   // Explicit reasoning_effort wins over the model-name suffix.
-  const effort = reasoning_effort ?? suffixEffort;
+  const effort = reasoning_effort ?? suffixEffort ?? defaultEffortForModel(model);
   if (effort) body.reasoning = { effort, summary: 'auto' };
 
   if (Array.isArray(tools) && tools.length) {

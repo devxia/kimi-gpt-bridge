@@ -6,11 +6,12 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { upstreamBase, upstreamHeaders, upstreamError } from './upstream.js';
 import { kgbHome, getValidToken } from './token-store.js';
+import { applyCatalogModelPolicy, isRetiredModel } from './model-policy.js';
 
 // Floor for the catalog's client_version parameter. The Codex backend gates
 // new catalog entries on per-model minimal_client_version, so a stale floor
 // silently hides newly released models; resolveClientVersion() floats it.
-export const MODELS_CLIENT_VERSION = '0.153.4';
+export const MODELS_CLIENT_VERSION = '0.156.0';
 
 export const MARKER_START = '# >>> kimi-gpt-bridge >>>';
 export const MARKER_END = '# <<< kimi-gpt-bridge <<<';
@@ -19,11 +20,27 @@ export const MARKER_END = '# <<< kimi-gpt-bridge <<<';
 // endpoint changes). Keep in sync with the current ChatGPT generation.
 export const STATIC_FALLBACK_MODELS = [
   {
+    slug: 'gpt-6-sol',
+    displayName: 'GPT-6-Sol',
+    description: '',
+    contextWindow: 272000,
+    defaultEffort: 'medium',
+    efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+  },
+  {
+    slug: 'gpt-6-luna',
+    displayName: 'GPT-6-Luna',
+    description: '',
+    contextWindow: 272000,
+    defaultEffort: 'medium',
+    efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+  },
+  {
     slug: 'gpt-6-astra',
     displayName: 'GPT-6-Astra',
     description: '',
     contextWindow: 272000,
-    defaultEffort: 'low',
+    defaultEffort: 'medium',
     efforts: ['low', 'medium', 'high', 'xhigh', 'max'],
   },
   {
@@ -58,15 +75,7 @@ export const STATIC_FALLBACK_MODELS = [
     defaultEffort: 'medium',
     efforts: ['low', 'medium', 'high', 'xhigh'],
   },
-  {
-    slug: 'gpt-5.4-mini',
-    displayName: 'GPT-5.4-Mini',
-    description: '',
-    contextWindow: 272000,
-    defaultEffort: 'medium',
-    efforts: ['low', 'medium', 'high', 'xhigh'],
-  },
-];
+].map(applyCatalogModelPolicy);
 
 export const CLIENT_VERSION_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -177,6 +186,7 @@ export function selectModels(catalog, planType) {
       (m) =>
         m &&
         nonEmptyString(m.slug) &&
+        !isRetiredModel(m.slug) &&
         m.visibility === 'list' &&
         m.supported_in_api !== false &&
         (!Array.isArray(m.available_in_plans) ||
@@ -215,12 +225,13 @@ export function selectModels(catalog, planType) {
         defaultEffort,
         efforts,
       };
-    });
+    })
+    .map(applyCatalogModelPolicy);
 }
 
 // TOML basic strings can represent every Unicode scalar value. Reject lone JS
 // surrogates rather than emitting an escape that a conforming parser rejects.
-function tomlBasicString(value) {
+export function tomlBasicString(value) {
   if (typeof value !== 'string') throw new TypeError('TOML string values must be strings.');
   let out = '"';
   for (let i = 0; i < value.length; i += 1) {
@@ -274,6 +285,7 @@ export function buildConfigBlock(models, port) {
     lines.push(`[models.${tomlBasicString(`chatgpt/${m.slug}`)}]`);
     lines.push('provider = "kimi-gpt-bridge"');
     lines.push(`model = ${tomlBasicString(m.slug)}`);
+    lines.push(`display_name = ${tomlBasicString(nonEmptyString(m.displayName) ? m.displayName : m.slug)}`);
     if (Number.isInteger(m.contextWindow) && m.contextWindow > 0) {
       lines.push(`max_context_size = ${m.contextWindow}`);
     }
@@ -629,12 +641,18 @@ export function clearModelCache() {
 // Resolves the model id list for /v1/models: in-memory cache → file cache
 // (4h TTL) → live fetch → static fallback.
 export async function getModelIds({ fetchImpl = fetch, now = Date.now() } = {}) {
-  if (memoryCache && now - memoryCache.fetchedAt < MODELS_CACHE_TTL_MS) return memoryCache.ids;
+  if (memoryCache && now - memoryCache.fetchedAt < MODELS_CACHE_TTL_MS) {
+    const ids = memoryCache.ids.filter((id) => nonEmptyString(id) && !isRetiredModel(id));
+    if (ids.length) return ids;
+  }
   try {
     const data = JSON.parse(fs.readFileSync(modelsCachePath(), 'utf8'));
-    if (Array.isArray(data?.ids) && data.ids.length && now - data.fetchedAt < MODELS_CACHE_TTL_MS) {
-      memoryCache = { fetchedAt: data.fetchedAt, ids: data.ids };
-      return data.ids;
+    if (Array.isArray(data?.ids) && now - data.fetchedAt < MODELS_CACHE_TTL_MS) {
+      const ids = data.ids.filter((id) => nonEmptyString(id) && !isRetiredModel(id));
+      if (ids.length) {
+        memoryCache = { fetchedAt: data.fetchedAt, ids };
+        return ids;
+      }
     }
   } catch {
     /* no usable file cache */

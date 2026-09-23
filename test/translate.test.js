@@ -137,6 +137,23 @@ test('model name suffix parses effort; explicit reasoning_effort wins', () => {
   assert.equal('reasoning' in none, false);
 });
 
+test('Astra defaults to medium without overriding explicit or suffix efforts', () => {
+  assert.deepEqual(chatRequestToResponsesBody({ model: 'gpt-6-astra', messages: [] }).reasoning,
+    { effort: 'medium', summary: 'auto' });
+  for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+    const suffix = chatRequestToResponsesBody({ model: `gpt-6-astra-${effort}`, messages: [] });
+    assert.equal(suffix.model, 'gpt-6-astra');
+    assert.equal(suffix.reasoning.effort, effort);
+    const explicit = chatRequestToResponsesBody({ model: 'gpt-6-astra-max', reasoning_effort: effort, messages: [] });
+    assert.equal(explicit.reasoning.effort, effort);
+  }
+  for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-5.5', 'gpt-future']) {
+    const body = chatRequestToResponsesBody({ model, messages: [] });
+    assert.equal(body.model, model);
+    assert.equal(body.reasoning, undefined);
+  }
+});
+
 function sse(events) {
   return events.map((e) => `data: ${JSON.stringify(e)}\n\n`);
 }
